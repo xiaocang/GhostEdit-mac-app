@@ -46,6 +46,10 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
     private let modelPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let customModelField = NSTextField(string: "")
     private let customModelContainer = NSStackView()
+    private let ollamaURLField = NSTextField(string: "")
+    private let ollamaSettingsContainer = NSStackView()
+    private let refreshOllamaModelsButton = NSButton(title: "Refresh Models", target: nil, action: nil)
+    private var installedOllamaModels: [String] = []
     private let hotkeyKeyPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let commandModifierCheckbox = NSButton(checkboxWithTitle: "Command", target: nil, action: nil)
     private let optionModifierCheckbox = NSButton(checkboxWithTitle: "Option", target: nil, action: nil)
@@ -77,7 +81,7 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         action: nil
     )
     private let showDiffPreviewCheckbox = NSButton(
-        checkboxWithTitle: "Show streaming preview before applying (Tab to accept, Esc to cancel)",
+        checkboxWithTitle: "Show streaming preview before applying (⌘Return to apply, Esc to cancel)",
         target: nil,
         action: nil
     )
@@ -110,7 +114,7 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
     private var tabViews: [Tab: NSView] = [:]
     private var currentTab: Tab = .general
 
-    private let providerOptions: [CLIProvider] = [.claude, .codex, .gemini]
+    private let providerOptions = CLIProvider.allCases
     private let hotkeyKeyOptions = HotkeySupport.keyOptions
     private var modelOptions: [ModelOption] = []
 
@@ -1369,8 +1373,8 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
 
         // Data rows
         let rows: [(String, String, String)] = [
-            ("Speed", hasLocalModel ? "2\u{2013}10 seconds" : "Instant", "2\u{2013}5 seconds"),
-            ("Network", "None (offline)", "Requires AI CLI"),
+            ("Speed", hasLocalModel ? "2\u{2013}10 seconds" : "Instant", "Depends on model"),
+            ("Network", "None (offline)", "Local Ollama or cloud"),
             ("Spelling", "Yes", "Yes"),
             ("Grammar",
              hasLocalModel ? "Yes (Model + Harper)" : "Yes (Harper)",
@@ -1519,6 +1523,16 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         customModelContainer.addArrangedSubview(makeFieldLabel("Custom"))
         customModelContainer.addArrangedSubview(customModelField)
 
+        ollamaURLField.placeholderString = AppConfig.default.ollamaBaseURL
+        ollamaURLField.toolTip = "Ollama server URL. Localhost keeps corrections on this Mac."
+        refreshOllamaModelsButton.target = self
+        refreshOllamaModelsButton.action = #selector(refreshOllamaModelsClicked)
+        ollamaSettingsContainer.orientation = .vertical
+        ollamaSettingsContainer.alignment = .leading
+        ollamaSettingsContainer.spacing = 8
+        ollamaSettingsContainer.addArrangedSubview(makeRow(label: makeFieldLabel("Server URL"), field: ollamaURLField))
+        ollamaSettingsContainer.addArrangedSubview(refreshOllamaModelsButton)
+
         languagePopup.removeAllItems()
         AppConfig.supportedLanguages.forEach { languagePopup.addItem(withTitle: $0.displayName) }
         tonePresetPopup.removeAllItems()
@@ -1541,6 +1555,7 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
             makeSection(title: "Provider & Model", views: [
                 makeRow(label: makeFieldLabel("Provider"), field: providerPopup),
                 providerDesc,
+                ollamaSettingsContainer,
                 makeRow(label: makeFieldLabel("Model"), field: modelPopup),
                 modelDesc,
                 customModelContainer,
@@ -1704,7 +1719,7 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
                 makeRow(label: makeFieldLabel("Modifiers"), field: modStack),
                 hotkeyPreviewLabel,
             ]),
-            makeSection(title: "Cloud Hotkey (LLM)", views: [
+            makeSection(title: "LLM Hotkey (Ollama or Cloud)", views: [
                 cloudBadgeRow,
                 makeRow(label: makeFieldLabel("Key"), field: cloudHotkeyKeyPopup),
                 makeRow(label: makeFieldLabel("Modifiers"), field: cloudModStack),
@@ -1725,7 +1740,7 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         diffPreviewDurationField.placeholderString = "5"
         diffPreviewDurationField.alignment = .left
 
-        let durationDesc = makeDescription("Seconds to show the diff popup before auto-dismissing (1–30)")
+        let durationDesc = makeDescription("Seconds before the green success indicator fades (1–30). Corrections stay until focus moves away.")
 
         let stack = makeTabStack(sections: [
             makeSection(title: "Correction", views: [
@@ -1737,7 +1752,7 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
                     checkbox: clipboardOnlyModeCheckbox,
                     description: "Corrected text is copied but not auto-pasted"
                 ),
-                makeRow(label: makeFieldLabel("Duration (sec)"), field: diffPreviewDurationField),
+                makeRow(label: makeFieldLabel("Success duration (sec)"), field: diffPreviewDurationField),
                 durationDesc,
             ]),
             makeSection(title: "Live Feedback", views: [
@@ -2000,6 +2015,7 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         let provider = config.resolvedProvider
         let providerIndex = providerOptions.firstIndex(of: provider) ?? 0
         providerPopup.selectItem(at: providerIndex)
+        ollamaURLField.stringValue = config.ollamaBaseURL
         launchAtLoginCheckbox.state = config.launchAtLogin ? .on : .off
         launchAtLoginSwitch.state = config.launchAtLogin ? .on : .off
         soundFeedbackCheckbox.state = config.soundFeedbackEnabled ? .on : .off
@@ -2032,6 +2048,9 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
     @objc private func providerPopupChanged() {
         let provider = selectedProvider()
         reloadModelOptions(for: provider, selectedModel: AppConfig.defaultModel(for: provider))
+        if provider == .ollama {
+            refreshOllamaModelsClicked()
+        }
     }
 
     @objc private func modelPopupChanged() {
@@ -2066,14 +2085,47 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
     }
 
     private func modelOptionsForProvider(_ provider: CLIProvider) -> [ModelOption] {
-        let predefined = provider.availableModels.map { modelName in
+        let models = provider == .ollama && !installedOllamaModels.isEmpty
+            ? installedOllamaModels : provider.availableModels
+        let predefined = models.map { modelName in
             ModelOption(title: modelName, value: modelName)
         }
         return predefined + [ModelOption(title: "Custom", value: nil)]
     }
 
     private func updateHint(for provider: CLIProvider) {
+        ollamaSettingsContainer.isHidden = provider != .ollama
+        if provider == .ollama {
+            hintLabel.stringValue = "Run Ollama, then Refresh Models to select an installed model. Use Custom for any model name. Localhost keeps your text on this Mac."
+            return
+        }
         hintLabel.stringValue = "If a \(provider.displayName) model is busy or fails, switch models and retry. Default: \(provider.defaultModel)."
+    }
+
+    @objc private func refreshOllamaModelsClicked() {
+        let baseURL = ollamaURLField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        refreshOllamaModelsButton.isEnabled = false
+        hintLabel.stringValue = "Connecting to Ollama…"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Result { try OllamaClient(baseURL: baseURL, timeoutSeconds: 5).listModels() }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.refreshOllamaModelsButton.isEnabled = true
+                guard self.selectedProvider() == .ollama,
+                      self.ollamaURLField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) == baseURL else { return }
+                switch result {
+                case let .success(models):
+                    let selectedModel = self.selectedModel()
+                    self.installedOllamaModels = models
+                    self.reloadModelOptions(for: .ollama, selectedModel: selectedModel)
+                    self.hintLabel.stringValue = models.isEmpty
+                        ? "Connected, but no models installed. Run: ollama pull qwen3:1.7b"
+                        : "Connected · \(models.count) installed models. Select a model and Save Changes."
+                case let .failure(error):
+                    self.hintLabel.stringValue = error.localizedDescription
+                }
+            }
+        }
     }
 
     private func loadHotkeyValues(from config: AppConfig) {
@@ -2161,14 +2213,14 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
 
     private func updateCloudHotkeyPreview() {
         guard let keyCode = selectedCloudHotkeyKeyCode() else {
-            cloudHotkeyPreviewLabel.stringValue = "Cloud hotkey: unavailable"
+            cloudHotkeyPreviewLabel.stringValue = "LLM hotkey: unavailable"
             cloudHotkeyBadgeLabel.stringValue = "-"
             return
         }
 
         let modifiers = selectedCloudHotkeyModifiers()
         let display = HotkeySupport.displayString(keyCode: keyCode, modifiers: modifiers)
-        cloudHotkeyPreviewLabel.stringValue = "Cloud hotkey: \(display)"
+        cloudHotkeyPreviewLabel.stringValue = "LLM hotkey: \(display)"
         cloudHotkeyBadgeLabel.stringValue = display
     }
 
@@ -2243,8 +2295,8 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
             NSSound.beep()
             let alert = NSAlert()
             alert.alertStyle = .warning
-            alert.messageText = "Cloud hotkey key is required"
-            alert.informativeText = "Choose a key for the cloud hotkey before saving."
+            alert.messageText = "LLM hotkey key is required"
+            alert.informativeText = "Choose a key for the LLM hotkey before saving."
             alert.runModal()
             return
         }
@@ -2253,8 +2305,8 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
             NSSound.beep()
             let alert = NSAlert()
             alert.alertStyle = .warning
-            alert.messageText = "Cloud hotkey modifiers are required"
-            alert.informativeText = "Select at least one modifier key (Command, Option, Control, or Shift) for the cloud hotkey."
+            alert.messageText = "LLM hotkey modifiers are required"
+            alert.informativeText = "Select at least one modifier key (Command, Option, Control, or Shift) for the LLM hotkey."
             alert.runModal()
             return
         }
@@ -2263,7 +2315,7 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
             let alert = NSAlert()
             alert.alertStyle = .warning
             alert.messageText = "Hotkeys must be different"
-            alert.informativeText = "The local and cloud hotkeys cannot use the same key combination."
+            alert.informativeText = "The local and LLM hotkeys cannot use the same key combination."
             alert.runModal()
             return
         }
@@ -2295,9 +2347,26 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
             return
         }
 
+        let ollamaBaseURL = ollamaURLField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if provider == .ollama {
+            guard let url = URL(string: ollamaBaseURL),
+                  ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+                  let host = url.host, !host.isEmpty,
+                  url.user == nil, url.password == nil,
+                  url.query == nil, url.fragment == nil else {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "Ollama server URL is invalid"
+                alert.informativeText = "Enter an HTTP or HTTPS server URL, for example http://127.0.0.1:11434."
+                alert.runModal()
+                return
+            }
+        }
+
         var config = configManager.loadConfig()
         config.provider = provider.rawValue
         config.model = model
+        config.ollamaBaseURL = ollamaBaseURL
         config.hotkeyKeyCode = hotkeyKeyCode
         config.hotkeyModifiers = hotkeyModifiers
         config.launchAtLogin = (launchAtLoginSwitch.state == .on)

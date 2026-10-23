@@ -4,6 +4,7 @@
 # Build artifacts
 build/
 DerivedData/
+harper-bridge/target/
 
 # Xcode user and transient files
 *.xcuserstate

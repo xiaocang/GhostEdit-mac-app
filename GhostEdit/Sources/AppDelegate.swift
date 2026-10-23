@@ -36,6 +36,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private var liveFeedbackMenuItem: NSMenuItem?
 
     private var pendingDiffOriginalText: String?
+    private var pendingPreviewSource: PreviewSource?
     private struct LineContext {
         let fullText: String
         let lineRange: NSRange
@@ -892,6 +893,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                             }
                             self.recordLocalFixHistoryEntry(original: textToFix, fixed: spellFixed)
                             self.showHUDWithDiff(original: textToFix, fixed: spellFixed, toolsUsed: "Harper + Dictionary")
+                        } else {
+                            self.updateHUD(state: .error(error.localizedDescription))
                         }
                         targetApp.activate(options: [])
                     }
@@ -1440,6 +1443,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             playErrorSound()
             restoreClipboardSnapshot(after: 0)
             setStatus("No text selected")
+            updateHUD(state: .error("No text selected. Focus a text field and try again."))
             finishProcessing()
             return
         }
@@ -1536,6 +1540,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             } catch {
                 let message = "Could not read prompt file.\n\n\(error.localizedDescription)"
                 restoreClipboardSnapshot(after: 0)
+                dismissHUD()
                 notifyFailure(body: "Correction Failed. \(message)")
                 showFailureAlert(title: "Correction Failed", message: message)
                 setStatus("Failed to read prompt file")
@@ -1552,23 +1557,60 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         if config.showDiffPreview {
             dismissHUD()
             stopProcessingIndicator()
+            // Bind the preview to the source field, selection and contents, not
+            // merely the application's PID (the user can edit while it is open).
+            let source = targetAppAtTrigger.flatMap { PreviewSource.capture(pid: $0.processIdentifier) }
 
             let controller = StreamingPreviewController(
                 originalText: selectedText,
                 onAccept: { [weak self] correctedText in
                     guard let self else { return }
                     self.streamingPreviewController = nil
+                    if config.clipboardOnlyMode || self.targetAppAtTrigger?.isTerminated == true {
+                        self.clipboardManager.writePlainText(correctedText)
+                        self.clipboardSnapshot = nil
+                        self.setStatus("Corrected text copied to clipboard")
+                        self.targetAppAtTrigger?.activate(options: [.activateAllWindows])
+                        self.finishProcessing()
+                        return
+                    }
+                    self.targetAppAtTrigger?.activate(options: [.activateAllWindows])
+                    self.pendingPreviewSource = source
                     self.applyCorrectedText(correctedText)
                 },
-                onCancel: { [weak self] in
+                onCopy: { [weak self] correctedText in
+                    self?.copyCorrectionResult(correctedText)
+                },
+                onDismiss: { [weak self] reason in
                     guard let self else { return }
                     self.streamingPreviewController = nil
+                    switch reason {
+                    case .cancelled:
+                        self.targetAppAtTrigger?.activate(options: [.activateAllWindows])
+                        self.setStatus("Correction cancelled")
+                    case .noChanges:
+                        if NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier,
+                           NSApp.keyWindow == nil {
+                            self.targetAppAtTrigger?.activate(options: [.activateAllWindows])
+                        }
+                        self.setStatus("No changes needed")
+                    case .focusChanged:
+                        self.setStatus("Correction preview dismissed")
+                    }
                     self.restoreClipboardSnapshot(after: 0)
-                    self.setStatus("Correction cancelled")
                     self.finishProcessing()
                 },
                 onRegenerate: { }
             )
+            controller.successDismissDelay = TimeInterval(config.diffPreviewDuration)
+            controller.validateAcceptance = { [weak self] in
+                guard let self else { return "Correction is no longer active." }
+                if config.clipboardOnlyMode || self.targetAppAtTrigger?.isTerminated == true { return nil }
+                guard let source, source.isUnchanged else {
+                    return "Source field, text or selection changed. Result kept here; copy it or cancel and run again."
+                }
+                return nil
+            }
             controller.onRegenerate = { [weak self, weak controller] in
                 guard let self, let controller else { return }
                 self.launchStreamingRequest(
@@ -1764,8 +1806,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                         startedAt: startedAt,
                         succeeded: false
                     )
-                    self.handleProcessingError(error)
                     self.dismissHUD()
+                    self.handleProcessingError(error)
                     self.finishProcessing()
                 }
             }
@@ -1773,6 +1815,37 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Streaming
+    private struct PreviewSource {
+        let pid: pid_t
+        let element: AXUIElement
+        let text: String?
+        let selectedText: String?
+        let range: CFTypeRef
+
+        static func capture(pid: pid_t) -> PreviewSource? {
+            let provider = SystemAXElementProvider()
+            let (error, focused) = provider.copyAttribute(
+                provider.createApplication(pid), kAXFocusedUIElementAttribute
+            )
+            guard error == .success, let focused,
+                  CFGetTypeID(focused) == AXUIElementGetTypeID() else { return nil }
+            let element = focused as! AXUIElement
+            let (_, value) = provider.copyAttribute(element, kAXValueAttribute)
+            let (_, selected) = provider.copyAttribute(element, kAXSelectedTextAttribute)
+            let (_, range) = provider.copyAttribute(element, kAXSelectedTextRangeAttribute)
+            guard let range, value is String || selected is String else { return nil }
+            return PreviewSource(pid: pid, element: element, text: value as? String,
+                                 selectedText: selected as? String, range: range)
+        }
+
+        var isUnchanged: Bool {
+            guard let current = Self.capture(pid: pid) else { return false }
+            return CFEqual(element, current.element)
+                && text == current.text
+                && selectedText == current.selectedText
+                && CFEqual(range, current.range)
+        }
+    }
 
     private func launchStreamingRequest(
         controller: StreamingPreviewController,
@@ -1782,6 +1855,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         model: String
     ) {
         let startedAt = Date()
+        let requestID = controller.requestID
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             do {
@@ -1789,18 +1863,22 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                     systemPrompt: prompt,
                     selectedText: selectedText,
                     onChunk: { accumulated in
+                        guard self.streamingPreviewController === controller,
+                              controller.isCurrentRequest(requestID) else { return }
                         controller.updateStreaming(accumulatedText: accumulated)
                     }
                 )
-                self.recordHistoryEntry(
-                    originalText: selectedText,
-                    generatedText: correctedText,
-                    provider: provider,
-                    model: model,
-                    startedAt: startedAt,
-                    succeeded: true
-                )
                 DispatchQueue.main.async {
+                    guard self.streamingPreviewController === controller,
+                          controller.isCurrentRequest(requestID) else { return }
+                    self.recordHistoryEntry(
+                        originalText: selectedText,
+                        generatedText: correctedText,
+                        provider: provider,
+                        model: model,
+                        startedAt: startedAt,
+                        succeeded: true
+                    )
                     self.updateTooltip(
                         original: selectedText,
                         corrected: correctedText,
@@ -1811,9 +1889,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             } catch {
                 DispatchQueue.main.async {
-                    controller.window?.close()
-                    self.streamingPreviewController = nil
-                    self.restoreClipboardSnapshot(after: 0)
+                    guard self.streamingPreviewController === controller,
+                          controller.isCurrentRequest(requestID) else { return }
                     self.recordHistoryEntry(
                         originalText: selectedText,
                         generatedText: "",
@@ -1822,8 +1899,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                         startedAt: startedAt,
                         succeeded: false
                     )
-                    self.handleProcessingError(error)
-                    self.finishProcessing()
+                    controller.showError(error.localizedDescription)
+                    self.setStatus("Correction failed; Retry or Cancel in preview")
                 }
             }
         }
@@ -1911,7 +1988,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 finishProcessing()
                 return
             }
-            devLog(.pasteBack, "Line write-back failed, falling through to standard replacement")
+            // Never replace an arbitrary selection after a failed line write.
+            clipboardManager.writePlainText(correctedText)
+            clipboardSnapshot = nil
+            setStatus("Line could not be replaced; corrected text copied to clipboard")
+            dismissHUD()
+            finishProcessing()
+            return
         }
 
         if let targetApp = targetAppAtTrigger {
@@ -1961,6 +2044,17 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         targetAppAtTrigger?.activate(options: [.activateAllWindows])
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            if let source = self.pendingPreviewSource,
+               !source.isUnchanged
+                || NSWorkspace.shared.frontmostApplication?.processIdentifier != source.pid {
+                // Keep the already copied result, but never paste into a newly
+                // focused field or another application.
+                self.clipboardSnapshot = nil
+                self.setStatus("Source changed; corrected text kept on clipboard")
+                self.dismissHUD()
+                self.finishProcessing()
+                return
+            }
             let pasted = self.clipboardManager.simulatePasteShortcut(using: .annotatedSession)
                 || self.clipboardManager.simulatePasteShortcut(using: .hidSystem)
 
@@ -1983,14 +2077,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.notifySuccessIfEnabled()
 
                 // Position cursor at end of pasted text (helps Electron apps like Slack, Discord, VS Code)
-                if let targetApp = self.targetAppAtTrigger {
+                if self.pendingPreviewSource == nil, let targetApp = self.targetAppAtTrigger {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) {
                         self.positionCursorAtEnd(pid: targetApp.processIdentifier)
                     }
                 }
 
                 // Restore the user's focus if they switched away from the target app.
-                if let userApp = userCurrentApp,
+                if self.pendingPreviewSource == nil, let userApp = userCurrentApp,
                    let targetApp = self.targetAppAtTrigger,
                    userApp.processIdentifier != targetApp.processIdentifier,
                    !userApp.isTerminated {
@@ -2009,13 +2103,24 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showHUD(state: HUDOverlayState) {
         if hudController == nil {
-            hudController = HUDOverlayController()
+            let controller = HUDOverlayController()
+            controller.onCopy = { [weak self] text in self?.copyCorrectionResult(text) }
+            hudController = controller
         }
-        hudController?.show(state: state)
+        hudController?.show(state: state, dismissAfter: successDismissDelay(for: state))
     }
 
     private func updateHUD(state: HUDOverlayState) {
-        hudController?.update(state: state)
+        hudController?.update(state: state, dismissAfter: successDismissDelay(for: state))
+    }
+
+    private func successDismissDelay(for state: HUDOverlayState) -> TimeInterval? {
+        switch state {
+        case .success, .successWithCount, .fallback:
+            return TimeInterval(configManager.loadConfig().diffPreviewDuration)
+        case .working, .successWithDiff, .error:
+            return nil
+        }
     }
 
     private func showHUDWithDiff(original: String, fixed: String, toolsUsed: String = "") {
@@ -2024,19 +2129,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             showHUD(state: .success)
             return
         }
-        let duration = TimeInterval(configManager.loadConfig().diffPreviewDuration)
-        if hudController == nil { hudController = HUDOverlayController() }
-        hudController?.show(state: .successWithDiff(segments, toolsUsed: toolsUsed), dismissAfter: duration)
+        showHUD(state: .successWithDiff(segments, toolsUsed: toolsUsed))
     }
 
     private func updateHUDWithDiff(original: String, corrected: String) {
         let segments = DiffSupport.charDiff(old: original, new: corrected)
         guard segments.contains(where: { $0.kind != .equal }) else {
-            updateHUD(state: .successWithCount(corrected.count))
+            updateHUD(state: .success)
             return
         }
-        let duration = TimeInterval(configManager.loadConfig().diffPreviewDuration)
-        hudController?.update(state: .successWithDiff(segments, toolsUsed: ""), dismissAfter: duration)
+        updateHUD(state: .successWithDiff(segments, toolsUsed: ""))
     }
 
     private func dismissHUD() {
@@ -2048,6 +2150,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private func finishProcessing() {
         isProcessing = false
         pendingDiffOriginalText = nil
+        pendingPreviewSource = nil
         pendingLineContext = nil
         targetAppAtTrigger = nil
         stopProcessingIndicator()
@@ -2696,6 +2799,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Clipboard
+
+    private func copyCorrectionResult(_ text: String) {
+        pendingClipboardRestore?.cancel()
+        pendingClipboardRestore = nil
+        clipboardSnapshot = nil
+        clipboardManager.writePlainText(text)
+        setStatus("Corrected text copied to clipboard")
+    }
 
     private func restoreClipboardSnapshot(after delay: TimeInterval) {
         guard let snapshot = clipboardSnapshot else {

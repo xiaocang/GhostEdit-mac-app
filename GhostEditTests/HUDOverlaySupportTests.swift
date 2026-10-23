@@ -89,11 +89,8 @@ final class HUDOverlaySupportTests: XCTestCase {
 
     // MARK: - autoDismissDelay(for:)
 
-    func testAutoDismissDelayForWorking() {
-        XCTAssertEqual(
-            HUDOverlaySupport.autoDismissDelay(for: .working),
-            HUDOverlaySupport.workingAutoDismissDelay
-        )
+    func testAutoDismissDelayForWorkingIsNil() {
+        XCTAssertNil(HUDOverlaySupport.autoDismissDelay(for: .working))
     }
 
     func testAutoDismissDelayForSuccess() {
@@ -103,32 +100,25 @@ final class HUDOverlaySupportTests: XCTestCase {
         )
     }
 
-    func testAutoDismissDelayForError() {
-        XCTAssertEqual(
-            HUDOverlaySupport.autoDismissDelay(for: .error("oops")),
-            HUDOverlaySupport.errorAutoDismissDelay
-        )
+    func testAutoDismissDelayForErrorIsNil() {
+        XCTAssertNil(HUDOverlaySupport.autoDismissDelay(for: .error("oops")))
     }
 
-    func testWorkingAndSuccessDelaysAreEqual() {
+    func testBriefConfirmationStatesAutoDismiss() {
         XCTAssertEqual(
-            HUDOverlaySupport.workingAutoDismissDelay,
+            HUDOverlaySupport.autoDismissDelay(for: .successWithCount(10)),
+            HUDOverlaySupport.successAutoDismissDelay
+        )
+        XCTAssertEqual(
+            HUDOverlaySupport.autoDismissDelay(for: .fallback),
             HUDOverlaySupport.successAutoDismissDelay
         )
     }
 
-    func testBriefDismissDelayIs1Second() {
-        XCTAssertEqual(HUDOverlaySupport.workingAutoDismissDelay, 1.0)
-        XCTAssertEqual(HUDOverlaySupport.successAutoDismissDelay, 1.0)
-    }
-
-    func testAllStatesReturnNonNilDelay() {
-        XCTAssertNotNil(HUDOverlaySupport.autoDismissDelay(for: .working))
-        XCTAssertNotNil(HUDOverlaySupport.autoDismissDelay(for: .success))
-        XCTAssertNotNil(HUDOverlaySupport.autoDismissDelay(for: .successWithCount(10)))
-        XCTAssertNotNil(HUDOverlaySupport.autoDismissDelay(for: .successWithDiff([DiffSegment(kind: .equal, text: "hi")], toolsUsed: "")))
-        XCTAssertNotNil(HUDOverlaySupport.autoDismissDelay(for: .error("x")))
-        XCTAssertNotNil(HUDOverlaySupport.autoDismissDelay(for: .fallback))
+    func testStickyStatesHaveNoAutoDismissDelay() {
+        XCTAssertNil(HUDOverlaySupport.autoDismissDelay(for: .working))
+        XCTAssertNil(HUDOverlaySupport.autoDismissDelay(for: .successWithDiff([], toolsUsed: "")))
+        XCTAssertNil(HUDOverlaySupport.autoDismissDelay(for: .error("x")))
     }
 
     // MARK: - windowOrigin(screenSize:)
@@ -176,11 +166,10 @@ final class HUDOverlaySupportTests: XCTestCase {
         XCTAssertFalse(HUDOverlaySupport.showsSpectacles(for: .successWithDiff(segments, toolsUsed: "")))
     }
 
-    func testSuccessWithDiffAutoDismissDelay() {
+    func testSuccessWithDiffAutoDismissDelayIsNil() {
         let segments = [DiffSegment(kind: .insertion, text: "x")]
-        XCTAssertEqual(
-            HUDOverlaySupport.autoDismissDelay(for: .successWithDiff(segments, toolsUsed: "")),
-            HUDOverlaySupport.diffAutoDismissDelay
+        XCTAssertNil(
+            HUDOverlaySupport.autoDismissDelay(for: .successWithDiff(segments, toolsUsed: ""))
         )
     }
 
@@ -246,16 +235,155 @@ final class HUDOverlaySupportTests: XCTestCase {
         XCTAssertGreaterThan(HUDOverlaySupport.diffFontSize, 0)
         XCTAssertGreaterThan(HUDOverlaySupport.diffContentInset, 0)
         XCTAssertGreaterThan(HUDOverlaySupport.diffIconSize, 0)
-        XCTAssertGreaterThan(HUDOverlaySupport.diffAutoDismissDelay, 0)
     }
 
-    func testTimingConstantsArePositive() {
-        XCTAssertGreaterThan(HUDOverlaySupport.fadeInDuration, 0)
-        XCTAssertGreaterThan(HUDOverlaySupport.fadeOutDuration, 0)
-        XCTAssertGreaterThan(HUDOverlaySupport.workingAutoDismissDelay, 0)
-        XCTAssertGreaterThan(HUDOverlaySupport.successAutoDismissDelay, 0)
-        XCTAssertGreaterThan(HUDOverlaySupport.errorAutoDismissDelay, 0)
+
+    // MARK: - diffPanelHeight
+
+    func testDiffPanelHeightKeepsCompactMinimum() {
+        let height = HUDOverlaySupport.diffPanelHeight(
+            intrinsicContentHeight: 100,
+            visibleFrameHeight: 900
+        )
+        XCTAssertEqual(height, 220)
     }
+
+    func testDiffPanelHeightGrowsForLongerContent() {
+        let height = HUDOverlaySupport.diffPanelHeight(
+            intrinsicContentHeight: 320,
+            visibleFrameHeight: 900
+        )
+        XCTAssertEqual(height, 320)
+    }
+
+    func testDiffPanelHeightCapsGrowthForVeryLongContent() {
+        let height = HUDOverlaySupport.diffPanelHeight(
+            intrinsicContentHeight: 2000,
+            visibleFrameHeight: 900
+        )
+        XCTAssertEqual(height, HUDOverlaySupport.diffWindowMaxHeight * 1.5)
+    }
+
+    func testDiffPanelHeightNeverExceedsVisibleScreen() {
+        let height = HUDOverlaySupport.diffPanelHeight(
+            intrinsicContentHeight: 2000,
+            visibleFrameHeight: 400
+        )
+        XCTAssertEqual(height, 340)
+    }
+
+    func testDiffPanelHeightOnShortScreen() {
+        let height = HUDOverlaySupport.diffPanelHeight(
+            intrinsicContentHeight: 2000,
+            visibleFrameHeight: 200
+        )
+        XCTAssertEqual(height, 220)
+    }
+
+    // MARK: - originalDiffDisplay
+
+    func testOriginalDiffDisplayKeepsOriginalTextAndDeletionRanges() {
+        let segments = [
+            DiffSegment(kind: .equal, text: "a"),
+            DiffSegment(kind: .deletion, text: "bad"),
+            DiffSegment(kind: .equal, text: "c"),
+        ]
+        let display = HUDOverlaySupport.originalDiffDisplay(from: segments)
+        XCTAssertEqual(display.text, "abadc", "The original erroneous text must remain unchanged")
+        XCTAssertEqual(display.deletionRanges, [NSRange(location: 1, length: 3)])
+        XCTAssertTrue(display.insertionAnchorRanges.isEmpty)
+    }
+
+    func testOriginalDiffDisplayAnchorsTrailingPureInsertionToPreviousCharacter() {
+        let segments = [
+            DiffSegment(kind: .equal, text: "Hello "),
+            DiffSegment(kind: .insertion, text: "world"),
+        ]
+        let display = HUDOverlaySupport.originalDiffDisplay(from: segments)
+        XCTAssertEqual(display.text, "Hello ")
+        XCTAssertEqual(display.deletionRanges, [])
+        XCTAssertEqual(display.insertionAnchorRanges, [NSRange(location: 5, length: 1)])
+    }
+
+    func testOriginalDiffDisplayAnchorsLeadingPureInsertionToNextCharacter() {
+        let segments = [
+            DiffSegment(kind: .insertion, text: "Hi "),
+            DiffSegment(kind: .equal, text: "there"),
+        ]
+        let display = HUDOverlaySupport.originalDiffDisplay(from: segments)
+        XCTAssertEqual(display.text, "there")
+        XCTAssertEqual(display.insertionAnchorRanges, [NSRange(location: 0, length: 1)])
+    }
+
+    func testOriginalDiffDisplaySkipsAnchorWhenInsertionFollowsDeletion() {
+        let segments = [
+            DiffSegment(kind: .equal, text: "a"),
+            DiffSegment(kind: .deletion, text: "b"),
+            DiffSegment(kind: .insertion, text: "x"),
+        ]
+        let display = HUDOverlaySupport.originalDiffDisplay(from: segments)
+        XCTAssertEqual(display.text, "ab")
+        XCTAssertEqual(display.deletionRanges, [NSRange(location: 1, length: 1)])
+        XCTAssertTrue(display.insertionAnchorRanges.isEmpty)
+    }
+
+    func testOriginalDiffDisplaySkipsAnchorWhenInsertionPrecedesDeletion() {
+        let segments = [
+            DiffSegment(kind: .equal, text: "a"),
+            DiffSegment(kind: .insertion, text: "x"),
+            DiffSegment(kind: .deletion, text: "b"),
+            DiffSegment(kind: .equal, text: "c"),
+        ]
+        let display = HUDOverlaySupport.originalDiffDisplay(from: segments)
+        XCTAssertEqual(display.text, "abc")
+        XCTAssertEqual(display.deletionRanges, [NSRange(location: 1, length: 1)])
+        XCTAssertTrue(display.insertionAnchorRanges.isEmpty)
+    }
+
+    func testOriginalDiffDisplayWithoutOriginalTextHasNoAnchor() {
+        let display = HUDOverlaySupport.originalDiffDisplay(
+            from: [DiffSegment(kind: .insertion, text: "new")]
+        )
+        XCTAssertEqual(display.text, "")
+        XCTAssertTrue(display.deletionRanges.isEmpty)
+        XCTAssertTrue(display.insertionAnchorRanges.isEmpty)
+    }
+
+    func testOriginalDiffDisplayDeduplicatesAnchorForAdjacentInsertions() {
+        let segments = [
+            DiffSegment(kind: .equal, text: "a"),
+            DiffSegment(kind: .insertion, text: "x"),
+            DiffSegment(kind: .insertion, text: "y"),
+        ]
+        let display = HUDOverlaySupport.originalDiffDisplay(from: segments)
+        XCTAssertEqual(display.insertionAnchorRanges, [NSRange(location: 0, length: 1)])
+    }
+
+    func testOriginalDiffDisplayAnchorKeepsComposedCharacterWhole() {
+        let emoji = "👨‍👩‍👧"
+        let segments = [
+            DiffSegment(kind: .equal, text: "a\(emoji)"),
+            DiffSegment(kind: .insertion, text: "!"),
+        ]
+        let display = HUDOverlaySupport.originalDiffDisplay(from: segments)
+        let textLength = (display.text as NSString).length
+        XCTAssertEqual(display.insertionAnchorRanges.count, 1)
+        let anchor = display.insertionAnchorRanges[0]
+        XCTAssertGreaterThan(anchor.length, 1)
+        XCTAssertEqual(NSMaxRange(anchor), textLength)
+    }
+
+    func testOriginalDiffDisplayIgnoresEmptyDeletion() {
+        let segments = [
+            DiffSegment(kind: .equal, text: "a"),
+            DiffSegment(kind: .deletion, text: ""),
+            DiffSegment(kind: .equal, text: "b"),
+        ]
+        let display = HUDOverlaySupport.originalDiffDisplay(from: segments)
+        XCTAssertEqual(display.text, "ab")
+        XCTAssertTrue(display.deletionRanges.isEmpty)
+    }
+
 
     func testFadeOutIsLongerThanFadeIn() {
         XCTAssertGreaterThanOrEqual(

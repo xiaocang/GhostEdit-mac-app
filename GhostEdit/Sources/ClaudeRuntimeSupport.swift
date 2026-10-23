@@ -1,6 +1,10 @@
 import Foundation
 
 enum ClaudeRuntimeSupport {
+    enum InvocationError: Error {
+        case httpProvider
+    }
+
     static func cliSearchPaths(
         provider: CLIProvider,
         homeDirectoryPath: String,
@@ -87,7 +91,7 @@ enum ClaudeRuntimeSupport {
         return .processFailed(exitCode: exitCode, stderr: preferredDetails)
     }
 
-    static func cliArguments(provider: CLIProvider, prompt: String, model: String) -> [String] {
+    static func cliArguments(provider: CLIProvider, prompt: String, model: String) throws -> [String] {
         let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
 
         switch provider {
@@ -129,6 +133,8 @@ enum ClaudeRuntimeSupport {
                 args.append(contentsOf: ["--model", trimmedModel])
             }
             return args
+        case .ollama:
+            throw InvocationError.httpProvider
         }
     }
 
@@ -136,7 +142,7 @@ enum ClaudeRuntimeSupport {
         cliSearchPaths(provider: .claude, homeDirectoryPath: homeDirectoryPath, environment: environment)
     }
 
-    static func claudeArguments(prompt: String, model: String) -> [String] {
-        cliArguments(provider: .claude, prompt: prompt, model: model)
+    static func claudeArguments(prompt: String, model: String) throws -> [String] {
+        try cliArguments(provider: .claude, prompt: prompt, model: model)
     }
 }

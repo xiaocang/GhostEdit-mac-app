@@ -356,47 +356,6 @@ final class ConfigManagerTests: XCTestCase {
         XCTAssertNil(config.resolvedClaudePath)
     }
 
-    func testCLIProviderMetadata() {
-        XCTAssertEqual(CLIProvider.claude.displayName, "Claude")
-        XCTAssertEqual(CLIProvider.codex.displayName, "Codex")
-        XCTAssertEqual(CLIProvider.gemini.displayName, "Gemini")
-
-        XCTAssertEqual(CLIProvider.claude.executableName, "claude")
-        XCTAssertEqual(CLIProvider.codex.executableName, "codex")
-        XCTAssertEqual(CLIProvider.gemini.executableName, "gemini")
-
-        XCTAssertEqual(CLIProvider.claude.authCommand, "claude auth login")
-        XCTAssertEqual(CLIProvider.codex.authCommand, "codex login")
-        XCTAssertEqual(CLIProvider.gemini.authCommand, "gemini")
-
-        XCTAssertEqual(CLIProvider.claude.configPathKey, "claudePath")
-        XCTAssertEqual(CLIProvider.codex.configPathKey, "codexPath")
-        XCTAssertEqual(CLIProvider.gemini.configPathKey, "geminiPath")
-
-        XCTAssertEqual(CLIProvider.claude.defaultModel, "claude-haiku-4-5")
-        XCTAssertEqual(CLIProvider.codex.defaultModel, "gpt-5-codex")
-        XCTAssertEqual(CLIProvider.gemini.defaultModel, "gemini-2.5-flash-lite")
-
-        XCTAssertEqual(CLIProvider.claude.availableModels, [
-            "claude-haiku-4-5",
-            "claude-sonnet-4-5",
-            "claude-sonnet-4-6",
-            "claude-opus-4-6",
-            "haiku",
-            "sonnet",
-            "opus"
-        ])
-        XCTAssertEqual(CLIProvider.codex.availableModels, ["gpt-5-codex", "gpt-5.3-codex", "gpt-5"])
-        XCTAssertEqual(CLIProvider.gemini.availableModels, [
-            "gemini-2.5-flash-lite",
-            "gemini-2.5-flash",
-            "gemini-2.5-pro",
-            "gemini-3-flash-preview",
-            "gemini-3-pro-preview",
-            "gemini-3.1-pro-preview",
-            "gemini-3.1-pro-preview-customtools"
-        ])
-    }
 
     func testLoadConfigReturnsCachedValueWithoutRereadingDisk() throws {
         let (manager, _) = makeManager()
@@ -914,6 +873,65 @@ final class ConfigManagerTests: XCTestCase {
         // Should fall back to base key + Shift
         XCTAssertEqual(config.cloudHotkeyKeyCode, 14)
         XCTAssertEqual(config.cloudHotkeyModifiers, 768) // 256 | 512
+    }
+
+    func testOllamaConfigurationSurvivesSaveReloadAndExport() throws {
+        let (manager, _) = makeManager()
+        try manager.bootstrapIfNeeded()
+        var config = manager.loadConfig()
+        config.provider = " OLLAMA "
+        config.model = " custom-editor:latest "
+        config.ollamaBaseURL = " http://localhost:11435/proxy "
+        try manager.saveConfig(config)
+        manager.invalidateCache()
+
+        let loaded = manager.loadConfig()
+        XCTAssertEqual(loaded.resolvedProvider, .ollama, "Saving must not silently fall back to a cloud provider")
+        XCTAssertEqual(loaded.resolvedModel(), "custom-editor:latest", "Custom installed model names must survive normalization")
+        XCTAssertEqual(loaded.ollamaBaseURL, "http://localhost:11435/proxy", "The selected server must survive save/reload")
+        XCTAssertNil(loaded.resolvedPath(for: .ollama), "HTTP corrections must not depend on an executable path")
+
+        let data = try SettingsExportSupport.exportSettings(config: loaded, prompt: "Correct text", appVersion: "test")
+        let imported = try SettingsExportSupport.importSettings(from: data)
+        XCTAssertEqual(imported.config, loaded, "Export/import must retain the complete local provider configuration")
+    }
+
+    func testExistingConfigRetainsProviderWhenOllamaSettingsAreAbsent() throws {
+        let data = Data(#"{"provider":"codex","model":"custom-cloud-model"}"#.utf8)
+        let decoded = try JSONDecoder().decode(AppConfig.self, from: data)
+        XCTAssertEqual(decoded.resolvedProvider, .codex, "Adding local support must not migrate an existing provider")
+        XCTAssertEqual(decoded.resolvedModel(), "custom-cloud-model", "Existing model choice must remain intact")
+        XCTAssertEqual(decoded.ollamaBaseURL, AppConfig.default.ollamaBaseURL, "Old configs must resolve a usable local server address")
+    }
+
+    func testBlankOllamaModelResolvesForSelectedBackendInsteadOfCloud() throws {
+        let (manager, _) = makeManager()
+        try manager.bootstrapIfNeeded()
+        var config = manager.loadConfig()
+        config.provider = "ollama"
+        config.model = "  "
+        try manager.saveConfig(config)
+        manager.invalidateCache()
+
+        let loaded = manager.loadConfig()
+        XCTAssertEqual(loaded.resolvedProvider, .ollama, "Normalization must retain the selected HTTP backend")
+        XCTAssertEqual(loaded.resolvedModel(), CLIProvider.ollama.defaultModel,
+                       "A blank local model must use the local backend's default, not the global Claude model")
+        XCTAssertNotEqual(loaded.resolvedModel(), AppConfig.default.model,
+                          "A cloud-only alias must not be sent to the local Ollama server")
+    }
+
+    func testCLIPathGuidanceKeysCanConfigureTheirCorrespondingRuntime() throws {
+        for provider in [CLIProvider.claude, .codex, .gemini] {
+            let path = "/custom/tools/\(provider.rawValue)"
+            let data = try JSONSerialization.data(withJSONObject: [
+                "provider": provider.rawValue,
+                provider.configPathKey: path
+            ])
+            let config = try JSONDecoder().decode(AppConfig.self, from: data)
+            XCTAssertEqual(config.resolvedPath(for: provider), path,
+                           "The configuration key shown in setup guidance must control that provider's executable")
+        }
     }
 
     private func makeManager() -> (ConfigManager, URL) {

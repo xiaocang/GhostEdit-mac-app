@@ -37,6 +37,7 @@ final class ShellRunner {
     private let fileManager: FileManager
     private let environment: [String: String]
     private let homeDirectoryPath: String
+    private let ollamaSessionConfiguration: URLSessionConfiguration
     weak var developerModeLogger: DeveloperModeLogger?
 
     private let discoveredPathLock = NSLock()
@@ -62,12 +63,14 @@ final class ShellRunner {
         configManager: ConfigManager,
         fileManager: FileManager = .default,
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        homeDirectoryPath: String? = nil
+        homeDirectoryPath: String? = nil,
+        ollamaSessionConfiguration: URLSessionConfiguration = .ephemeral
     ) {
         self.configManager = configManager
         self.fileManager = fileManager
         self.environment = environment
         self.homeDirectoryPath = homeDirectoryPath ?? fileManager.homeDirectoryForCurrentUser.path
+        self.ollamaSessionConfiguration = ollamaSessionConfiguration
     }
 
     func prewarm() {
@@ -76,6 +79,7 @@ final class ShellRunner {
 
             let config = self.configManager.loadConfig()
             let provider = config.resolvedProvider
+            guard provider != .ollama else { return }
             _ = try? self.resolveCLIPath(
                 provider: provider,
                 preferredPath: config.resolvedPath(for: provider)
@@ -164,6 +168,10 @@ final class ShellRunner {
     ) throws -> String {
         let config = configManager.loadConfig()
         let provider = config.resolvedProvider
+        if provider == .ollama {
+            return try correctTextWithOllama(systemPrompt: systemPrompt, selectedText: selectedText,
+                                            config: config, onChunk: onChunk)
+        }
 
         // Try the persistent session first (Claude only, zero bootstrap overhead).
         if let result = tryPersistentSessionStreaming(
@@ -212,6 +220,9 @@ final class ShellRunner {
     func correctText(systemPrompt: String, selectedText: String) throws -> String {
         let config = configManager.loadConfig()
         let provider = config.resolvedProvider
+        if provider == .ollama {
+            return try correctTextWithOllama(systemPrompt: systemPrompt, selectedText: selectedText, config: config)
+        }
 
         // Try the persistent session first (Claude only, zero bootstrap overhead).
         if let result = tryPersistentSession(
@@ -254,6 +265,22 @@ final class ShellRunner {
 
         devLog(.cliResponse, "CLI response (\(trimmed.count) chars): \(DeveloperModeSupport.truncate(trimmed))")
         return trimmed
+    }
+
+    private func correctTextWithOllama(
+        systemPrompt: String,
+        selectedText: String,
+        config: AppConfig,
+        onChunk: ((String) -> Void)? = nil
+    ) throws -> String {
+        var prompt = systemPrompt
+        if let language = AppConfig.languageInstruction(for: config.resolvedLanguage) {
+            prompt += " \(language)"
+        }
+        return try OllamaClient(baseURL: config.ollamaBaseURL, timeoutSeconds: config.timeoutSeconds,
+                                sessionConfiguration: ollamaSessionConfiguration)
+            .correctText(systemPrompt: prompt, selectedText: selectedText,
+                         model: config.resolvedModel(for: .ollama), onChunk: onChunk)
     }
 
     func correctTextPreservingTokens(
@@ -351,6 +378,7 @@ final class ShellRunner {
         selectedText: String,
         config: AppConfig
     ) -> String? {
+        guard config.resolvedProvider == .claude else { return nil }
         persistentSessionLock.lock()
         guard let session = persistentSession, session.isReady else {
             persistentSessionLock.unlock()
@@ -396,6 +424,7 @@ final class ShellRunner {
         config: AppConfig,
         onChunk: @escaping (String) -> Void
     ) -> String? {
+        guard config.resolvedProvider == .claude else { return nil }
         persistentSessionLock.lock()
         guard let session = persistentSession, session.isReady else {
             persistentSessionLock.unlock()
@@ -518,7 +547,7 @@ final class ShellRunner {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executablePath)
         process.currentDirectoryURL = configManager.baseDirectoryURL
-        let args = ClaudeRuntimeSupport.cliArguments(
+        let args = try ClaudeRuntimeSupport.cliArguments(
             provider: provider,
             prompt: prompt,
             model: model
@@ -598,7 +627,7 @@ final class ShellRunner {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executablePath)
         process.currentDirectoryURL = configManager.baseDirectoryURL
-        let args = ClaudeRuntimeSupport.cliArguments(
+        let args = try ClaudeRuntimeSupport.cliArguments(
             provider: provider,
             prompt: prompt,
             model: trimmedModel

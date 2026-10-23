@@ -1,12 +1,12 @@
 # GhostEdit
 
-**Free, open-source offline grammar checker for macOS. Fix grammar, spelling, and punctuation in any app with a single hotkey - powered by local Hugging Face models (T5, Gemma, Llama), Claude, OpenAI Codex, or Gemini. On-device AI grammar correction with streaming preview, live feedback, writing coach, and no subscriptions. The best free Grammarly alternative for Mac.**
+**Free, open-source grammar checker for macOS. Fix grammar, spelling, and punctuation in any app with a hotkey using local Ollama/Hugging Face models or Claude, OpenAI Codex, and Gemini. Includes streaming preview, live feedback, writing coach, and history. Local providers keep text on-device; cloud providers send it to the selected service.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: macOS](https://img.shields.io/badge/Platform-macOS%2013%2B-black.svg)](https://github.com/nareshnavinash/GhostEdit/releases)
 [![Latest Release](https://img.shields.io/github/v/release/nareshnavinash/GhostEdit)](https://github.com/nareshnavinash/GhostEdit/releases/latest)
 
-> GhostEdit is a lightweight macOS menu bar app that corrects grammar, spelling, and punctuation in any text field system-wide. Press a hotkey and your text is fixed instantly - using local Hugging Face models on-device or your choice of Claude, Codex, or Gemini. Streaming preview shows corrections in real time. No accounts, no subscriptions, no data leaves your Mac.
+> GhostEdit is a macOS menu bar app that corrects text system-wide. Use cmd+E for rule-based/local Hugging Face corrections, or cmd+shift+E for the provider selected in Settings, including fully local Ollama.
 
 ![GhostEdit launch preview](remotion/out/TwitterBanner.png)
 
@@ -55,17 +55,17 @@ You can now double-click the app to open it normally! (You only need to do this 
 ## Why GhostEdit?
 
 - **No account required** - uses AI CLIs you already have installed (Claude, Codex, Gemini). No sign-ups, no subscriptions.
-- **Privacy-first** - text never leaves your machine through a third-party service. Corrections run through your own local LLM. No telemetry, no data collection.
+- **Local privacy option** - Ollama at a localhost URL and local Hugging Face models keep correction text on this Mac. Cloud CLIs and remote Ollama URLs send text to their configured services.
 - **Free and open source** - no premium tiers, no word limits, no feature gates. Full grammar correction, streaming preview, writing coaching, and history - all included.
 - **Works everywhere** - correct text in any macOS app: Slack, Notion, VS Code, Mail, Pages, or any text field. One hotkey, any app.
-- **Bring your own AI** - switch between Claude, OpenAI Codex, and Gemini from Settings. Pick the model that works best for you.
+- **Bring your own AI** - switch between Ollama, Claude, OpenAI Codex, and Gemini in Settings.
 - **On-device grammar** - local Hugging Face models (T5, Gemma, Llama) and Harper provide fully offline corrections with no API calls needed.
 - **Streaming preview** - watch corrections appear in real time with character-level diff highlighting, then accept, regenerate, or cancel.
 
 ## How It Works
 
 1. **Press cmd+E** for a local fix - a two-pass pipeline runs Harper grammar rules first, then your local Hugging Face model corrects spelling and grammar entirely offline
-2. **Press cmd+shift+E** for a deep LLM fix - Claude, Codex, or Gemini rewrites and polishes your text with full contextual understanding, shown live via streaming preview
+2. **Press cmd+shift+E** for an LLM fix - use Ollama locally or a cloud CLI. Enable **Settings > Behavior > Show streaming preview before applying** to review before writing back.
 3. **No selection? No problem** - if no text is selected, GhostEdit automatically extracts the line at your cursor and corrects it
 4. **See what changed** - an integrated diff overlay highlights every correction in the HUD before it's applied, and you can undo any fix instantly
 
@@ -75,7 +75,7 @@ No setup needed for local fixes. For LLM fixes, install any supported AI CLI and
 
 ### v7.5 Highlights
 
-- **Streaming preview with live diff**: Watch AI corrections stream in character by character with real-time diff highlighting - accept (Tab), regenerate (R), or cancel (Esc) from the preview window with change navigation
+- **Streaming preview with live diff**: Watch corrections stream in, inspect character-level changes, apply (⌘Return), retry (⌘R), or cancel (Esc).
 - **Per-model custom prompt templates**: Each local Hugging Face model can have its own task prompt - customize via Settings > Local Models or `localModelPromptTemplates` in config
 - **Two-pass local correction pipeline**: cmd+E runs Harper grammar rules first, then applies your local Hugging Face model for deeper corrections - catching more issues than either engine alone
 - **Line-at-cursor extraction**: No need to select text first - GhostEdit automatically detects and corrects the entire line at your cursor position in any app
@@ -89,7 +89,7 @@ No setup needed for local fixes. For LLM fixes, install any supported AI CLI and
 ### Core Features
 
 - **Fire-and-forget correction**: Press the hotkey, switch to any app - corrected text is pasted back automatically, even if the target app is in the background
-- **Native HUD overlay**: A glossy floating ghost indicator shows "Working on it..." (with spectacles) and "Done!" (idle ghost) with integrated diff, then fades away
+- **Native HUD overlay**: Loading stays visible for the whole request. A green check fades after success; correction results stay available for copying until you interact outside the panel.
 - **Smart paste-back**: Uses accessibility (AX) text replacement for native apps (no focus change needed), with delayed verification and automatic clipboard fallback for Electron apps (Slack, Discord, VS Code)
 - **Multi-provider support**: Choose between Claude, OpenAI Codex, and Gemini - switch providers and models from Settings
 - **Multi-language support**: Correct text in 30+ languages - auto-detect or pick a specific language in Settings
@@ -98,7 +98,7 @@ No setup needed for local fixes. For LLM fixes, install any supported AI CLI and
 - **Token preservation**: Mentions, emojis, URLs, emails, file paths, and inline code are preserved during correction across all paths (cloud, local, streaming, live feedback)
 - **Correction history**: Browse, copy, and export past corrections as CSV
 - **Statistics dashboard**: View correction counts, success rates, provider/model breakdown, and estimated token usage
-- **Diff preview**: Word-level diff integrated into the HUD overlay with red/green highlights showing changes before applying - enable via Settings or `showDiffPreview` in config
+- **Diff preview**: Optional side-by-side review before applying; automatic mode shows original errors and the applied correction in a persistent, scrollable HUD.
 - **Undo last correction**: Revert the most recent correction via menu bar
 - **Auto-retry with fallback model**: If the selected model fails, GhostEdit automatically retries with the next available model - with smart error classification to skip non-retriable failures
 - **Per-app profiles**: Configure different tone, model, or provider per application via `~/.ghostedit/profiles.json`
@@ -121,14 +121,17 @@ No setup needed for local fixes. For LLM fixes, install any supported AI CLI and
 
 ### Streaming Preview
 
-When you trigger a cloud LLM correction (cmd+shift+E), GhostEdit opens a streaming preview window that shows the AI response as it arrives - character by character with real-time diff highlighting.
+Enable **Settings > Behavior > Show streaming preview before applying**. The LLM hotkey (cmd+shift+E by default) then opens a side-by-side preview for Ollama or your selected cloud provider. With preview disabled, the correction is applied directly.
 
 **Controls:**
-- **Tab** - Accept the correction and paste it back
-- **R** - Regenerate (re-run the correction without closing the window)
-- **Esc** - Cancel and discard the correction
+- **⌘Return** - Apply the completed correction and return to the source app.
+- **⇧⌘C / Copy** - Copy the full corrected text without applying it or closing the preview.
+- **⌘R** - Retry after completion or failure.
+- **Esc / Cancel / titlebar close** - Discard the preview and return to the source app. Late results cannot update another correction.
 
-The preview shows a character-level diff with added text in green and removed text in red. Use the prev/next change navigation buttons to jump between changes. A live character count updates as the response streams in.
+The loading spinner remains active while the LLM is working, including streaming and retries. Identical results show a green check and fade away after **Settings > Behavior > Success duration**. Results with corrections do not have a dismissal timer: the original errors have red underlines, and corrected insertions appear in green. Missing text or punctuation is marked by underlining the adjacent original character; emoji and other composed characters remain intact. Use the prev/next buttons to navigate changes.
+
+Copying, selecting, and scrolling inside a result do not close it. Moving focus to another window or clicking, typing, or scrolling outside dismisses it without bringing the source app back to the front. Request failures stop the spinner and stay inline with Retry and Cancel. Tab retains normal focus navigation; bare R does not regenerate. Applying is refused if the source field, contents, or selection changed, or its identity cannot be verified; Copy remains available. Clipboard-only mode copies rather than pastes. Closing discards the preview, but an already-running model request may finish in the background. Rounded material backgrounds are masked separately from their contents so the backdrop cannot expose square corners, while text and controls stay fully opaque.
 
 ### Live Feedback
 
@@ -149,20 +152,20 @@ The widget shows a colored status dot (green = clean, red = issues found). Click
 
 ### Dual Hotkey: Local Fix vs LLM Fix
 
-GhostEdit gives you two ways to fix text, each with its own fully configurable hotkey. The base hotkey (cmd+E) runs entirely on your Mac - no internet, no API keys, no delay. The cloud hotkey (cmd+shift+E) sends text to a cloud AI for deeper rewrites with streaming preview. Both hotkeys can be customized independently in **Settings > Hotkey**.
+GhostEdit has two independently configurable hotkeys: cmd+E for rules/local Hugging Face inference, and cmd+shift+E for the selected LLM provider. The latter can use **Ollama entirely locally** or a cloud CLI. Configure both in **Settings > Hotkey**.
 
 Here's how they compare:
 
 | | **cmd+E** (Local Fix) | **cmd+shift+E** (LLM Fix) |
 |---|---|---|
-| **Speed** | Instant (Harper) or 2-10s (local model) | 2-5 seconds |
-| **Network** | None (fully offline) | Requires AI CLI |
-| **Engine** | Two-pass: Harper rules → local Hugging Face model | Claude, Codex, or Gemini |
+| **Speed** | Instant (rules) or model-dependent | Model-dependent |
+| **Network** | None (fully offline) | None for local Ollama; cloud CLIs require internet |
+| **Engine** | Harper rules → optional Hugging Face model | Ollama, Claude, Codex, or Gemini |
 | **Spelling** | Yes | Yes |
 | **Grammar** | Yes (local model) / Basic (Harper) | Yes (contextual) |
 | **Punctuation** | Yes (local model) / No (Harper) | Yes |
 | **Rewrites** | Light corrections only | Full sentence restructuring |
-| **Preview** | Instant apply | Streaming preview with diff |
+| **Preview** | Instant apply | Optional streaming preview with diff |
 | **No selection** | Extracts line at cursor | Extracts line at cursor |
 | **Best for** | Quick typo fixes, Slack messages, emails | Polishing important text, deep rewrites |
 
@@ -217,13 +220,14 @@ Your token is stored at `~/.huggingface/token` (the standard HuggingFace locatio
 
 **For local model corrections (cmd+E):** Python 3.9+ is required. Install via Homebrew: `brew install python`. See **Settings > Local Models** to download models and install packages.
 
-**For LLM corrections (cmd+shift+E):** You need at least one AI CLI installed:
+**For LLM corrections (cmd+shift+E):** Choose local Ollama or one of the cloud CLIs:
 
 | Provider | Install | Auth |
 |----------|---------|------|
+| Ollama (local HTTP) | Install [Ollama](https://ollama.com), then `ollama pull qwen3:1.7b` | No login for local models |
 | Claude | `brew install claude` or [download](https://claude.com/claude-code) | `claude auth login` |
 | OpenAI Codex | `npm install -g @openai/codex` | `codex login` |
-| Gemini | `npm install -g @anthropic-ai/gemini` | `gemini` |
+| Gemini | `npm install -g @google/gemini-cli` | `gemini` |
 
 **Supported models:**
 
@@ -232,6 +236,17 @@ Your token is stored at `~/.huggingface/token` (the standard HuggingFace locatio
 | Claude | claude-haiku-4-5, claude-sonnet-4-5, claude-sonnet-4-6, claude-opus-4-6, haiku, sonnet, opus |
 | OpenAI Codex | gpt-5-codex, gpt-5.3-codex, gpt-5 |
 | Gemini | gemini-2.5-flash-lite, gemini-2.5-flash, gemini-2.5-pro, gemini-3-flash-preview, gemini-3-pro-preview, gemini-3.1-pro-preview |
+| Ollama | Installed model names from **Refresh Models**, or any exact model tag via **Custom** |
+
+### Local Ollama Setup
+
+1. Start the Ollama app, or run `ollama serve`.
+2. Install a model: `ollama pull qwen3:1.7b`.
+3. In **Settings > General**, choose **Ollama (Local)**. Keep Server URL `http://127.0.0.1:11434` for on-device corrections.
+4. Click **Refresh Models** to check the connection and load installed models, then select one and save.
+5. Enable streaming preview in **Settings > Behavior**, focus/select text in another app, and press **cmd+shift+E**. **cmd+E remains the separate rules/Hugging Face path.**
+
+No Python environment or cloud CLI is needed for Ollama. Small models trade correction quality for latency; review the diff before applying. Connection failures suggest starting Ollama; missing-model errors include the `ollama pull` command. If using a proxy, set its server base URL (not `/api/chat`). HTTPS is supported; authenticated services such as Magpie are not configured by this integration.
 
 ## Build from Source
 
@@ -239,6 +254,12 @@ Your token is stored at `~/.huggingface/token` (the standard HuggingFace locatio
 
 ```bash
 brew install xcodegen
+```
+
+Install [Rust via rustup](https://rustup.rs). Xcode builds the Harper static library and Swift C module automatically using `scripts/build_harper.sh`; generated files stay in `build/`. Universal builds need both Rust targets:
+
+```bash
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
 ```
 
 2. Generate Xcode project:
@@ -254,6 +275,22 @@ open GhostEdit.xcodeproj
 ```
 
 4. Set your signing team and run.
+
+### Local development build
+
+`dev.sh` builds with Xcode's **Apple Development** signing identity, verifies the signature, and installs the app in `/Applications/GhostEdit.app`. It restarts GhostEdit if it was already running:
+
+```bash
+./dev.sh --run
+```
+
+The default development team is `WNF89D7V44`, matching the local Xcode setup. To use another team or a Debug build:
+
+```bash
+DEVELOPMENT_TEAM=YOUR_TEAM_ID CONFIGURATION=Debug ./dev.sh --run
+```
+
+Full Xcode must have a valid Apple Development certificate for that team. The script generates the Xcode project, keeps build products in `build/DerivedDataDev`, and preserves the separate app and framework bundle identifiers. Omit `--run` to install without launching when GhostEdit is not already running.
 
 ## Configuration
 
@@ -272,6 +309,7 @@ Default `config.json`:
   "claudePath": "",
   "codexPath": "",
   "geminiPath": "",
+  "ollamaBaseURL": "http://127.0.0.1:11434",
   "provider": "claude",
   "model": "sonnet",
   "hotkeyKeyCode": 14,
@@ -298,9 +336,10 @@ Default `config.json`:
 ```
 
 Notes:
-- `provider` controls which CLI is used.
+- `provider` selects `"ollama"` (native HTTP), `"claude"`, `"codex"`, or `"gemini"` (CLI).
 - `model` is shared and interpreted by the selected provider.
 - `claudePath`, `codexPath`, and `geminiPath` can be empty if auto-discovery works.
+- `ollamaBaseURL` is the Ollama server base URL. Set `provider` to `"ollama"` and `model` to an installed model tag such as `"qwen3:1.7b"`; the CLI path fields are unused for Ollama.
 - If auto-discovery fails, set an absolute path for that provider.
 - If a model is busy/fails, GhostEdit automatically retries with the next available model.
 - `hotkeyKeyCode` / `hotkeyModifiers` control the local fix hotkey (cmd+E by default).

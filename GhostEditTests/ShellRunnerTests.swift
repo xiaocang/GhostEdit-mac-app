@@ -13,6 +13,68 @@ final class ShellRunnerTests: XCTestCase {
         try super.tearDownWithError()
     }
 
+    func testOllamaPreservingPipelinesUseHTTPDespiteReadyClaudeSession() throws {
+        let testEnv = try makeRunnerEnvironment()
+        let (url, configuration) = OllamaURLProtocol.stub { stub in
+            let payload = try stub.requestJSON()
+            let messages = try XCTUnwrap(payload["messages"] as? [[String: String]])
+            XCTAssertEqual(messages.count, 2)
+            XCTAssertTrue(messages[0]["content"]?.contains("Respond in French") == true)
+            XCTAssertTrue(messages[0]["content"]?.contains("GHOSTEDIT_KEEP") == true)
+            XCTAssertTrue(messages[1]["content"]?.contains("__GHOSTEDIT_KEEP_0__") == true)
+            XCTAssertEqual(payload["model"] as? String, "qwen3:0.6b")
+            let text = "Bonjour — __GHOSTEDIT_KEEP_0__.\n\n    Bienvenue."
+            let data = try JSONSerialization.data(withJSONObject: [
+                "message": ["content": text], "done": true
+            ])
+            stub.respond(chunks: [data])
+        }
+        var config = AppConfig.default.withProvider(.ollama, executablePath: "", model: "qwen3:0.6b")
+        config.ollamaBaseURL = url
+        config.language = "fr"
+        try testEnv.manager.saveConfig(config)
+        let runner = ShellRunner(configManager: testEnv.manager, environment: [:],
+                                 ollamaSessionConfiguration: configuration)
+        let stale = MockPersistentCLISession()
+        stale.mockIsReady = true
+        stale.mockSendResult = PersistentCLISession.StreamResult(text: "wrong Claude output")
+        stale.mockStreamResult = PersistentCLISession.StreamResult(text: "wrong Claude output")
+        runner.setPersistentSessionForTesting(stale)
+        let expected = "Bonjour — @Chema.\n\n    Bienvenue."
+        XCTAssertEqual(try runner.correctTextPreservingTokens(systemPrompt: "Fix", selectedText: "hello @Chema"), expected)
+        let delivered = expectation(description: "restored streaming callback")
+        XCTAssertEqual(try runner.correctTextStreamingPreservingTokens(
+            systemPrompt: "Fix", selectedText: "hello @Chema", onChunk: { text in
+                XCTAssertTrue(Thread.isMainThread)
+                XCTAssertEqual(text, expected)
+                delivered.fulfill()
+            }), expected)
+        wait(for: [delivered], timeout: 2)
+        XCTAssertEqual(stale.sendCallCount, 0)
+        XCTAssertEqual(stale.streamCallCount, 0)
+    }
+
+    func testNonClaudeProvidersNeverUseReadyClaudeSession() throws {
+        for provider in [CLIProvider.gemini, .codex] {
+            let testEnv = try makeRunnerEnvironment()
+            let executable = try makeExecutableScript(
+                named: "non-claude.sh", contents: "#!/bin/zsh\nprint -r -- 'non-Claude response'",
+                homeURL: testEnv.homeURL)
+            try testEnv.manager.saveConfig(
+                AppConfig.default.withProvider(provider, executablePath: executable.path))
+            let stale = MockPersistentCLISession()
+            stale.mockIsReady = true
+            stale.mockSendResult = PersistentCLISession.StreamResult(text: "wrong provider")
+            stale.mockStreamResult = PersistentCLISession.StreamResult(text: "wrong provider")
+            testEnv.runner.setPersistentSessionForTesting(stale)
+            XCTAssertEqual(try testEnv.runner.correctText(systemPrompt: "Fix", selectedText: "text"), "non-Claude response")
+            XCTAssertEqual(try testEnv.runner.correctTextStreaming(
+                systemPrompt: "Fix", selectedText: "text", onChunk: { _ in }), "non-Claude response")
+            XCTAssertEqual(stale.sendCallCount, 0)
+            XCTAssertEqual(stale.streamCallCount, 0)
+        }
+    }
+
     func testCorrectTextStripsClaudeCodeEnvironmentVariables() throws {
         let testEnv = try makeRunnerEnvironment()
         let envLog = testEnv.homeURL.appendingPathComponent("env.log")
@@ -1496,6 +1558,8 @@ private extension AppConfig {
             codexPath = executablePath
         case .gemini:
             geminiPath = executablePath
+        case .ollama:
+            break
         }
 
         return AppConfig(

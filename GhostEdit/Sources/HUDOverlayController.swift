@@ -1,25 +1,42 @@
 import AppKit
 
 final class HUDOverlayController {
+    /// Writes the full corrected text to the pasteboard. The host can override
+    /// this to coordinate its own clipboard snapshot handling.
+    var onCopy: (String) -> Void = { text in
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+    }
+
+    private let dismissMonitor = FloatingPanelDismissMonitor()
     private var panel: NSPanel?
-    private var effectView: NSVisualEffectView?
     private var tintOverlay: NSView?
     private var spinner: NSProgressIndicator?
     private var ghostImageView: NSImageView?
     private var messageLabel: NSTextField?
-    private var diffLabel: NSTextField?
+    private var copyButton: NSButton?
+    private var copyFeedbackWorkItem: DispatchWorkItem?
     private var dismissWorkItem: DispatchWorkItem?
     private var ghostWithSpectacles: NSImage?
     private var ghostWithoutSpectacles: NSImage?
     private var isDiffMode = false
     private var dismissOverride: TimeInterval?
+    private var latestCorrectedText = ""
+    /// Invalidates work scheduled for an earlier panel generation, so a stale
+    /// fade completion can never hide a newer working or result panel.
+    private var transitionGeneration = 0
+
+    deinit {
+        dismissMonitor.stop()
+    }
 
     func show(state: HUDOverlayState, dismissAfter: TimeInterval? = nil) {
-        dismissWorkItem?.cancel()
-        dismissWorkItem = nil
+        transitionGeneration += 1
+        cancelPendingDismissal()
         dismissOverride = dismissAfter
 
-        let needsDiff = isDiffState(state)
+        let needsDiff = HUDContentSupport.isDiffState(state)
         if panel == nil || needsDiff != isDiffMode || needsDiff {
             tearDownPanel()
             if needsDiff {
@@ -49,15 +66,16 @@ final class HUDOverlayController {
             panel.animator().alphaValue = 1
         }
 
+        startDismissMonitorIfNeeded(for: state)
         scheduleAutoDismissIfNeeded(for: state)
     }
 
     func update(state: HUDOverlayState, dismissAfter: TimeInterval? = nil) {
-        dismissWorkItem?.cancel()
-        dismissWorkItem = nil
+        transitionGeneration += 1
+        cancelPendingDismissal()
         dismissOverride = dismissAfter
 
-        let needsDiff = isDiffState(state)
+        let needsDiff = HUDContentSupport.isDiffState(state)
         if panel == nil || needsDiff != isDiffMode || needsDiff {
             tearDownPanel()
             if needsDiff {
@@ -73,43 +91,55 @@ final class HUDOverlayController {
         panel.alphaValue = 1
         panel.orderFrontRegardless()
 
+        startDismissMonitorIfNeeded(for: state)
         scheduleAutoDismissIfNeeded(for: state)
     }
 
     func dismiss() {
-        dismissWorkItem?.cancel()
-        dismissWorkItem = nil
+        transitionGeneration += 1
+        cancelPendingDismissal()
+        dismissMonitor.stop()
 
         guard let panel else { return }
 
+        let generation = transitionGeneration
+        let fadingPanel = panel
         let fadeDuration = TimeInterval(HUDOverlaySupport.fadeOutDuration)
 
         NSAnimationContext.runAnimationGroup { context in
             context.duration = fadeDuration
             context.allowsImplicitAnimation = true
-            panel.animator().alphaValue = 0
+            fadingPanel.animator().alphaValue = 0
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + fadeDuration + 0.05) { [weak self] in
-            self?.panel?.orderOut(nil)
-            self?.panel?.alphaValue = 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + fadeDuration + 0.05) { [weak self, weak fadingPanel] in
+            guard let self, let fadingPanel,
+                  self.panel === fadingPanel,
+                  self.transitionGeneration == generation else { return }
+            fadingPanel.orderOut(nil)
+            fadingPanel.alphaValue = 1
         }
     }
 
-    private func isDiffState(_ state: HUDOverlayState) -> Bool {
-        if case .successWithDiff = state { return true }
-        return false
+    private func cancelPendingDismissal() {
+        dismissWorkItem?.cancel()
+        dismissWorkItem = nil
     }
 
     private func tearDownPanel() {
+        transitionGeneration += 1
+        dismissMonitor.stop()
+        cancelPendingDismissal()
+        copyFeedbackWorkItem?.cancel()
+        copyFeedbackWorkItem = nil
         panel?.orderOut(nil)
         panel = nil
-        effectView = nil
         tintOverlay = nil
         spinner = nil
         ghostImageView = nil
         messageLabel = nil
-        diffLabel = nil
+        copyButton = nil
+        latestCorrectedText = ""
         isDiffMode = false
     }
 
@@ -117,8 +147,9 @@ final class HUDOverlayController {
         isDiffMode = false
         let width = HUDOverlaySupport.windowWidth
         let height = HUDOverlaySupport.windowHeight
-        let screenSize = NSScreen.main?.frame.size ?? CGSize(width: 1920, height: 1080)
-        let origin = HUDOverlaySupport.windowOrigin(screenSize: screenSize)
+        let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
+        let centered = HUDOverlaySupport.windowOrigin(screenSize: screenFrame.size)
+        let origin = CGPoint(x: screenFrame.origin.x + centered.x, y: screenFrame.origin.y + centered.y)
 
         let newPanel = NSPanel(
             contentRect: NSRect(x: origin.x, y: origin.y, width: width, height: height),
@@ -134,24 +165,16 @@ final class HUDOverlayController {
         newPanel.collectionBehavior = [.canJoinAllSpaces, .transient, .ignoresCycle]
         newPanel.isMovableByWindowBackground = false
 
-        let effectView = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: width, height: height))
-        effectView.material = .popover
-        effectView.state = .active
-        effectView.blendingMode = .behindWindow
-        effectView.wantsLayer = true
-        effectView.layer?.cornerRadius = HUDOverlaySupport.cornerRadius
-        effectView.layer?.masksToBounds = true
-        effectView.alphaValue = 0.92
+        let background = FloatingPanelBackgroundView(frame: NSRect(x: 0, y: 0, width: width, height: height))
 
         let iconSize = HUDOverlaySupport.iconSize
         let imageView = NSImageView(frame: .zero)
         imageView.imageScaling = .scaleProportionallyUpOrDown
         imageView.translatesAutoresizingMaskIntoConstraints = false
-        imageView.image = renderGhostImage(size: iconSize, spectacles: true)
 
         let message = NSTextField(labelWithString: "")
         message.font = NSFont.systemFont(ofSize: HUDOverlaySupport.messageFontSize, weight: .medium)
-        message.textColor = .white
+        message.textColor = .labelColor
         message.alignment = .center
         message.lineBreakMode = .byWordWrapping
         message.maximumNumberOfLines = 2
@@ -170,41 +193,38 @@ final class HUDOverlayController {
         stack.spacing = HUDOverlaySupport.verticalSpacing
         stack.translatesAutoresizingMaskIntoConstraints = false
 
-        effectView.addSubview(stack)
+        background.addSubview(stack)
         NSLayoutConstraint.activate([
             imageView.widthAnchor.constraint(equalToConstant: iconSize),
             imageView.heightAnchor.constraint(equalToConstant: iconSize),
-            stack.centerXAnchor.constraint(equalTo: effectView.centerXAnchor),
-            stack.centerYAnchor.constraint(equalTo: effectView.centerYAnchor),
+            stack.centerXAnchor.constraint(equalTo: background.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: background.centerYAnchor),
             stack.leadingAnchor.constraint(
-                greaterThanOrEqualTo: effectView.leadingAnchor,
+                greaterThanOrEqualTo: background.leadingAnchor,
                 constant: HUDOverlaySupport.contentInset
             ),
             stack.trailingAnchor.constraint(
-                lessThanOrEqualTo: effectView.trailingAnchor,
+                lessThanOrEqualTo: background.trailingAnchor,
                 constant: -HUDOverlaySupport.contentInset
             ),
         ])
 
-        // Tint overlay for state color
+        // Tint overlay for state color. The background's rounded mask clips it.
         let tint = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
         tint.wantsLayer = true
         tint.layer?.backgroundColor = NSColor.clear.cgColor
-        tint.layer?.cornerRadius = HUDOverlaySupport.cornerRadius
-        tint.layer?.masksToBounds = true
-        effectView.addSubview(tint, positioned: .below, relativeTo: stack)
         tint.translatesAutoresizingMaskIntoConstraints = false
+        background.addSubview(tint, positioned: .below, relativeTo: stack)
         NSLayoutConstraint.activate([
-            tint.leadingAnchor.constraint(equalTo: effectView.leadingAnchor),
-            tint.trailingAnchor.constraint(equalTo: effectView.trailingAnchor),
-            tint.topAnchor.constraint(equalTo: effectView.topAnchor),
-            tint.bottomAnchor.constraint(equalTo: effectView.bottomAnchor),
+            tint.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            tint.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            tint.topAnchor.constraint(equalTo: background.topAnchor),
+            tint.bottomAnchor.constraint(equalTo: background.bottomAnchor),
         ])
 
-        newPanel.contentView = effectView
+        newPanel.contentView = background
 
         self.panel = newPanel
-        self.effectView = effectView
         self.tintOverlay = tint
         self.spinner = progress
         self.ghostImageView = imageView
@@ -218,10 +238,29 @@ final class HUDOverlayController {
 
         let panelWidth = HUDOverlaySupport.diffWindowWidth
         let inset = HUDOverlaySupport.diffContentInset
-        let screenSize = NSScreen.main?.frame.size ?? CGSize(width: 1920, height: 1080)
+        let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
+
+        let display = HUDOverlaySupport.originalDiffDisplay(from: segments)
+        let originalAttributed = attributedOriginalText(display)
+        let correctedAttributed = attributedCorrectedText(from: segments)
+        latestCorrectedText = StreamingPreviewSupport.correctedText(from: segments)
+
+        // Fixed chrome around both text areas: insets, top row, headers, copy row.
+        let chromeHeight: CGFloat =
+            inset * 2 + HUDOverlaySupport.diffIconSize + 8 + 15 + 4 + 10 + 15 + 4 + 10 + 26
+        let textMeasureWidth = panelWidth - inset * 2
+        let measuredOriginal = measuredTextHeight(originalAttributed, width: textMeasureWidth)
+        let measuredCorrected = measuredTextHeight(correctedAttributed, width: textMeasureWidth)
+        let panelHeight = HUDOverlaySupport.diffPanelHeight(
+            intrinsicContentHeight: chromeHeight + measuredOriginal + measuredCorrected,
+            visibleFrameHeight: screenFrame.height
+        )
+        let textBudget = max(64, panelHeight - chromeHeight)
+        let originalViewport = max(32, min(measuredOriginal, textBudget / 2))
+        let correctedViewport = max(32, textBudget - originalViewport)
 
         let newPanel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: HUDOverlaySupport.diffWindowMaxHeight),
+            contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: panelHeight),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -234,32 +273,23 @@ final class HUDOverlayController {
         newPanel.collectionBehavior = [.canJoinAllSpaces, .transient, .ignoresCycle]
         newPanel.isMovableByWindowBackground = false
 
-        let ev = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: HUDOverlaySupport.diffWindowMaxHeight))
-        ev.material = .popover
-        ev.state = .active
-        ev.blendingMode = .behindWindow
-        ev.wantsLayer = true
-        ev.layer?.cornerRadius = HUDOverlaySupport.cornerRadius
-        ev.layer?.masksToBounds = true
-        ev.alphaValue = 0.92
+        let ev = FloatingPanelBackgroundView(
+            frame: NSRect(x: 0, y: 0, width: panelWidth, height: panelHeight)
+        )
 
-        // Content stack
-        let contentStack = NSStackView()
-        contentStack.orientation = .vertical
-        contentStack.spacing = 8
-        contentStack.alignment = .leading
-        contentStack.translatesAutoresizingMaskIntoConstraints = false
-
-        // Top row: small ghost + "Done!"
         let iconSize = HUDOverlaySupport.diffIconSize
         let imageView = NSImageView(frame: .zero)
         imageView.imageScaling = .scaleProportionallyUpOrDown
         imageView.translatesAutoresizingMaskIntoConstraints = false
-        imageView.image = renderGhostImage(size: iconSize, spectacles: false)
+        imageView.image = NSImage(
+            systemSymbolName: "checkmark.circle.fill",
+            accessibilityDescription: "Corrections applied"
+        )
+        imageView.contentTintColor = .systemGreen
 
         let message = NSTextField(labelWithString: "Done!")
         message.font = NSFont.systemFont(ofSize: HUDOverlaySupport.messageFontSize, weight: .medium)
-        message.textColor = .white
+        message.textColor = .labelColor
         message.translatesAutoresizingMaskIntoConstraints = false
 
         let topRow = NSStackView(views: [imageView, message])
@@ -268,14 +298,6 @@ final class HUDOverlayController {
         topRow.spacing = 8
         topRow.translatesAutoresizingMaskIntoConstraints = false
 
-        NSLayoutConstraint.activate([
-            imageView.widthAnchor.constraint(equalToConstant: iconSize),
-            imageView.heightAnchor.constraint(equalToConstant: iconSize),
-        ])
-
-        contentStack.addArrangedSubview(topRow)
-
-        // Tools-used header (if provided)
         if !toolsUsed.isEmpty {
             let toolsLabel = NSTextField(labelWithString: toolsUsed)
             toolsLabel.font = NSFont.systemFont(ofSize: 9, weight: .regular)
@@ -284,72 +306,81 @@ final class HUDOverlayController {
             }
             toolsLabel.textColor = .secondaryLabelColor
             toolsLabel.translatesAutoresizingMaskIntoConstraints = false
-
-            let pillView = NSView()
-            pillView.wantsLayer = true
-            pillView.layer?.backgroundColor = NSColor.secondaryLabelColor.withAlphaComponent(0.1).cgColor
-            pillView.layer?.cornerRadius = 4
-            pillView.translatesAutoresizingMaskIntoConstraints = false
-            pillView.addSubview(toolsLabel)
-            NSLayoutConstraint.activate([
-                toolsLabel.leadingAnchor.constraint(equalTo: pillView.leadingAnchor, constant: 6),
-                toolsLabel.trailingAnchor.constraint(equalTo: pillView.trailingAnchor, constant: -6),
-                toolsLabel.topAnchor.constraint(equalTo: pillView.topAnchor, constant: 2),
-                toolsLabel.bottomAnchor.constraint(equalTo: pillView.bottomAnchor, constant: -2),
-            ])
-            contentStack.addArrangedSubview(pillView)
+            topRow.addArrangedSubview(toolsLabel)
         }
 
-        // Diff text
-        let diffField = NSTextField(wrappingLabelWithString: "")
-        diffField.isEditable = false
-        diffField.isSelectable = false
-        diffField.isBezeled = false
-        diffField.drawsBackground = false
-        diffField.backgroundColor = .clear
-        diffField.font = NSFont.systemFont(ofSize: HUDOverlaySupport.diffFontSize)
-        diffField.translatesAutoresizingMaskIntoConstraints = false
+        let originalHeader = headerLabel("Original")
+        let correctedHeader = headerLabel("Corrected")
+        let (originalScroll, _) = makeDiffTextView(
+            attributed: originalAttributed,
+            width: textMeasureWidth,
+            accessibilityLabel: "Original text with corrections marked"
+        )
+        let (correctedScroll, _) = makeDiffTextView(
+            attributed: correctedAttributed,
+            width: textMeasureWidth,
+            accessibilityLabel: "Corrected text"
+        )
 
-        let attrString = NSMutableAttributedString()
-        for segment in segments {
-            switch segment.kind {
-            case .equal:
-                let attrs: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.systemFont(ofSize: HUDOverlaySupport.diffFontSize),
-                    .foregroundColor: NSColor.labelColor
-                ]
-                attrString.append(NSAttributedString(string: segment.text, attributes: attrs))
-            case .insertion:
-                let attrs: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.systemFont(ofSize: HUDOverlaySupport.diffFontSize),
-                    .foregroundColor: NSColor.systemGreen,
-                    .backgroundColor: NSColor.systemGreen.withAlphaComponent(0.15),
-                    .underlineStyle: NSUnderlineStyle.single.rawValue
-                ]
-                attrString.append(NSAttributedString(string: segment.text, attributes: attrs))
-            case .deletion:
-                break  // Skip deletions - only show insertions in green
-            }
-        }
-        diffField.attributedStringValue = attrString
-        contentStack.addArrangedSubview(diffField)
+        let copy = NSButton(
+            title: "Copy corrected text",
+            target: self,
+            action: #selector(copyCorrectedText)
+        )
+        copy.bezelStyle = .rounded
+        copy.controlSize = .small
+        copy.font = NSFont.systemFont(ofSize: 11)
+        copy.translatesAutoresizingMaskIntoConstraints = false
+        copy.setAccessibilityLabel("Copy corrected text")
 
-        ev.addSubview(contentStack)
+        ev.addSubview(topRow)
+        ev.addSubview(originalHeader)
+        ev.addSubview(originalScroll)
+        ev.addSubview(correctedHeader)
+        ev.addSubview(correctedScroll)
+        ev.addSubview(copy)
+
         NSLayoutConstraint.activate([
-            contentStack.leadingAnchor.constraint(equalTo: ev.leadingAnchor, constant: inset),
-            contentStack.trailingAnchor.constraint(equalTo: ev.trailingAnchor, constant: -inset),
-            contentStack.topAnchor.constraint(equalTo: ev.topAnchor, constant: inset),
-            contentStack.bottomAnchor.constraint(lessThanOrEqualTo: ev.bottomAnchor, constant: -inset),
+            topRow.topAnchor.constraint(equalTo: ev.topAnchor, constant: inset),
+            topRow.leadingAnchor.constraint(equalTo: ev.leadingAnchor, constant: inset),
+            topRow.trailingAnchor.constraint(lessThanOrEqualTo: ev.trailingAnchor, constant: -inset),
+            topRow.heightAnchor.constraint(equalToConstant: HUDOverlaySupport.diffIconSize),
+            imageView.widthAnchor.constraint(equalToConstant: iconSize),
+            imageView.heightAnchor.constraint(equalToConstant: iconSize),
+
+            originalHeader.topAnchor.constraint(equalTo: topRow.bottomAnchor, constant: 8),
+            originalHeader.leadingAnchor.constraint(equalTo: ev.leadingAnchor, constant: inset),
+            originalHeader.trailingAnchor.constraint(lessThanOrEqualTo: ev.trailingAnchor, constant: -inset),
+            originalHeader.heightAnchor.constraint(equalToConstant: 15),
+
+            originalScroll.topAnchor.constraint(equalTo: originalHeader.bottomAnchor, constant: 4),
+            originalScroll.leadingAnchor.constraint(equalTo: ev.leadingAnchor, constant: inset),
+            originalScroll.trailingAnchor.constraint(equalTo: ev.trailingAnchor, constant: -inset),
+            originalScroll.heightAnchor.constraint(equalToConstant: originalViewport),
+
+            correctedHeader.topAnchor.constraint(equalTo: originalScroll.bottomAnchor, constant: 10),
+            correctedHeader.leadingAnchor.constraint(equalTo: ev.leadingAnchor, constant: inset),
+            correctedHeader.trailingAnchor.constraint(lessThanOrEqualTo: ev.trailingAnchor, constant: -inset),
+            correctedHeader.heightAnchor.constraint(equalToConstant: 15),
+
+            correctedScroll.topAnchor.constraint(equalTo: correctedHeader.bottomAnchor, constant: 4),
+            correctedScroll.leadingAnchor.constraint(equalTo: ev.leadingAnchor, constant: inset),
+            correctedScroll.trailingAnchor.constraint(equalTo: ev.trailingAnchor, constant: -inset),
+            correctedScroll.heightAnchor.constraint(equalToConstant: correctedViewport),
+
+            copy.topAnchor.constraint(equalTo: correctedScroll.bottomAnchor, constant: 10),
+            copy.trailingAnchor.constraint(equalTo: ev.trailingAnchor, constant: -inset),
+            copy.bottomAnchor.constraint(equalTo: ev.bottomAnchor, constant: -inset),
+            copy.heightAnchor.constraint(equalToConstant: 26),
+            copy.widthAnchor.constraint(greaterThanOrEqualToConstant: 140),
         ])
 
-        // Tint overlay
+        // Tint overlay behind the content; the background's rounded mask clips it.
         let tint = NSView(frame: .zero)
         tint.wantsLayer = true
         tint.layer?.backgroundColor = NSColor.systemGreen.withAlphaComponent(0.06).cgColor
-        tint.layer?.cornerRadius = HUDOverlaySupport.cornerRadius
-        tint.layer?.masksToBounds = true
         tint.translatesAutoresizingMaskIntoConstraints = false
-        ev.addSubview(tint, positioned: .below, relativeTo: contentStack)
+        ev.addSubview(tint, positioned: .below, relativeTo: nil)
         NSLayoutConstraint.activate([
             tint.leadingAnchor.constraint(equalTo: ev.leadingAnchor),
             tint.trailingAnchor.constraint(equalTo: ev.trailingAnchor),
@@ -357,51 +388,175 @@ final class HUDOverlayController {
             tint.bottomAnchor.constraint(equalTo: ev.bottomAnchor),
         ])
 
-        // Size to fit content
-        ev.layoutSubtreeIfNeeded()
-        let intrinsicHeight = contentStack.fittingSize.height + inset * 2
-        let panelHeight = min(intrinsicHeight, HUDOverlaySupport.diffWindowMaxHeight)
-
-        newPanel.setContentSize(NSSize(width: panelWidth, height: panelHeight))
-        ev.frame = NSRect(x: 0, y: 0, width: panelWidth, height: panelHeight)
         newPanel.contentView = ev
 
-        // Center on screen
-        let windowSize = CGSize(width: panelWidth, height: panelHeight)
-        let origin = HUDOverlaySupport.windowOrigin(screenSize: screenSize, windowSize: windowSize)
-        newPanel.setFrameOrigin(origin)
-
-        // Click to dismiss
-        let clickGesture = NSClickGestureRecognizer(target: self, action: #selector(handleDiffClick))
-        ev.addGestureRecognizer(clickGesture)
+        let centered = HUDOverlaySupport.windowOrigin(
+            screenSize: screenFrame.size,
+            windowSize: NSSize(width: panelWidth, height: panelHeight)
+        )
+        newPanel.setFrameOrigin(
+            CGPoint(x: screenFrame.origin.x + centered.x, y: screenFrame.origin.y + centered.y)
+        )
 
         self.panel = newPanel
-        self.effectView = ev
         self.tintOverlay = tint
         self.ghostImageView = imageView
         self.messageLabel = message
-        self.diffLabel = diffField
+        self.copyButton = copy
     }
 
-    @objc private func handleDiffClick() {
-        dismiss()
+    private func headerLabel(_ title: String) -> NSTextField {
+        let label = NSTextField(labelWithString: title)
+        label.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
+        label.textColor = .secondaryLabelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        return label
+    }
+
+    private func makeDiffTextView(
+        attributed: NSAttributedString,
+        width: CGFloat,
+        accessibilityLabel: String
+    ) -> (NSScrollView, NSTextView) {
+        let textView = NSTextView()
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 6, height: 6)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.minSize = NSSize(width: 0, height: 0)
+        textView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize = NSSize(
+            width: max(1, width),
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.frame = NSRect(x: 0, y: 0, width: width, height: 100)
+        textView.textStorage?.setAttributedString(attributed)
+        textView.sizeToFit()
+        var fittedFrame = textView.frame
+        fittedFrame.size.width = width
+        textView.frame = fittedFrame
+        textView.setAccessibilityLabel(accessibilityLabel)
+
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.documentView = textView
+        return (scrollView, textView)
+    }
+
+    private func attributedOriginalText(_ display: HUDOverlaySupport.OriginalDiffDisplay) -> NSAttributedString {
+        let font = NSFont.systemFont(ofSize: HUDOverlaySupport.diffFontSize)
+        let result = NSMutableAttributedString(
+            string: display.text,
+            attributes: [
+                .font: font,
+                .foregroundColor: NSColor.labelColor,
+            ]
+        )
+        let length = (display.text as NSString).length
+        for range in display.deletionRanges where NSMaxRange(range) <= length {
+            result.addAttributes([
+                .foregroundColor: NSColor.systemRed,
+                .underlineStyle: NSUnderlineStyle.single.rawValue,
+                .underlineColor: NSColor.systemRed,
+                .backgroundColor: NSColor.systemRed.withAlphaComponent(0.08),
+            ], range: range)
+        }
+        for range in display.insertionAnchorRanges where NSMaxRange(range) <= length {
+            result.addAttributes([
+                .underlineStyle: NSUnderlineStyle.single.rawValue,
+                .underlineColor: NSColor.systemRed,
+            ], range: range)
+        }
+        return result
+    }
+
+    private func attributedCorrectedText(from segments: [DiffSegment]) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        let font = NSFont.systemFont(ofSize: HUDOverlaySupport.diffFontSize)
+        for segment in segments {
+            switch segment.kind {
+            case .equal:
+                result.append(NSAttributedString(
+                    string: segment.text,
+                    attributes: [
+                        .font: font,
+                        .foregroundColor: NSColor.labelColor,
+                    ]
+                ))
+            case .insertion:
+                result.append(NSAttributedString(
+                    string: segment.text,
+                    attributes: [
+                        .font: font,
+                        .foregroundColor: NSColor.systemGreen,
+                        .backgroundColor: NSColor.systemGreen.withAlphaComponent(0.14),
+                        .underlineStyle: NSUnderlineStyle.single.rawValue,
+                        .underlineColor: NSColor.systemGreen,
+                    ]
+                ))
+            case .deletion:
+                break
+            }
+        }
+        return result
+    }
+
+    private func measuredTextHeight(_ attributed: NSAttributedString, width: CGFloat) -> CGFloat {
+        let bounds = attributed.boundingRect(
+            with: NSSize(width: max(1, width - 12), height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+        return ceil(bounds.height) + 12
+    }
+
+    @objc private func copyCorrectedText() {
+        onCopy(latestCorrectedText)
+        copyFeedbackWorkItem?.cancel()
+        copyButton?.title = "Copied!"
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.copyButton?.title = "Copy corrected text"
+        }
+        copyFeedbackWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: workItem)
     }
 
     private func applyContent(for state: HUDOverlayState) {
-        // Diff mode content is set up during buildDiffPanel
-        if case .successWithDiff = state { return }
+        // Diff mode content is set up during buildDiffPanel.
+        if HUDContentSupport.isDiffState(state) { return }
 
-        let content = HUDOverlaySupport.content(for: state)
-        messageLabel?.stringValue = content.message
+        let message = HUDOverlaySupport.content(for: state).message
+        messageLabel?.stringValue = message
+        messageLabel?.toolTip = message
 
-        let spectacles = HUDOverlaySupport.showsSpectacles(for: state)
-        ghostImageView?.image = renderGhostImage(
-            size: HUDOverlaySupport.iconSize,
-            spectacles: spectacles
-        )
+        if case .success = state {
+            let symbol = NSImage(
+                systemSymbolName: "checkmark.circle.fill",
+                accessibilityDescription: "No changes needed"
+            )
+            ghostImageView?.image = symbol
+            ghostImageView?.contentTintColor = .systemGreen
+            ghostImageView?.setAccessibilityLabel("No changes needed")
+        } else {
+            ghostImageView?.image = renderGhostImage(
+                size: HUDOverlaySupport.iconSize,
+                spectacles: HUDOverlaySupport.showsSpectacles(for: state)
+            )
+            ghostImageView?.contentTintColor = nil
+            ghostImageView?.setAccessibilityLabel("GhostEdit")
+        }
 
-        // Spinner for working state
-        if case .working = state {
+        if HUDContentSupport.showsSpinner(for: state) {
             spinner?.isHidden = false
             spinner?.startAnimation(nil)
         } else {
@@ -409,35 +564,51 @@ final class HUDOverlayController {
             spinner?.isHidden = true
         }
 
-        // Color tint per state
-        let tintColor: NSColor
-        switch state {
-        case .working:
-            tintColor = NSColor.systemBlue.withAlphaComponent(0.06)
-        case .success, .successWithCount:
-            tintColor = NSColor.systemGreen.withAlphaComponent(0.06)
-        case .successWithDiff:
-            tintColor = NSColor.systemGreen.withAlphaComponent(0.06)
-        case .fallback:
-            tintColor = NSColor.systemOrange.withAlphaComponent(0.06)
-        case .error:
-            tintColor = NSColor.systemRed.withAlphaComponent(0.06)
+        tintOverlay?.layer?.backgroundColor = tintColor(for: state).withAlphaComponent(0.06).cgColor
+    }
+
+    private func tintColor(for state: HUDOverlayState) -> NSColor {
+        switch HUDContentSupport.tintColorName(for: state) {
+        case "systemBlue":
+            return .systemBlue
+        case "systemOrange":
+            return .systemOrange
+        case "systemRed":
+            return .systemRed
+        default:
+            return .systemGreen
         }
-        tintOverlay?.layer?.backgroundColor = tintColor.cgColor
+    }
+
+    /// Only ready corrections and failures dismiss on outside interaction. Working
+    /// and brief confirmation states must never install the monitor.
+    private func startDismissMonitorIfNeeded(for state: HUDOverlayState) {
+        dismissMonitor.stop()
+        guard isStickyResultState(state), let panel else { return }
+        dismissMonitor.start(for: panel) { [weak self] in
+            self?.dismiss()
+        }
+    }
+
+    private func isStickyResultState(_ state: HUDOverlayState) -> Bool {
+        switch state {
+        case .successWithDiff, .error:
+            return true
+        case .working, .success, .successWithCount, .fallback:
+            return false
+        }
     }
 
     private func scheduleAutoDismissIfNeeded(for state: HUDOverlayState) {
-        let delay: TimeInterval
-        if let override = dismissOverride {
-            delay = override
-        } else if let computed = HUDOverlaySupport.autoDismissDelay(for: state) {
-            delay = computed
-        } else {
-            return
-        }
+        // Working, correction, and failure states are timerless; an obsolete
+        // diff/error override cannot schedule a dismiss for them.
+        guard let defaultDelay = HUDOverlaySupport.autoDismissDelay(for: state) else { return }
+        let delay = dismissOverride ?? defaultDelay
 
+        let generation = transitionGeneration
         let workItem = DispatchWorkItem { [weak self] in
-            self?.dismiss()
+            guard let self, self.transitionGeneration == generation else { return }
+            self.dismiss()
         }
         dismissWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)

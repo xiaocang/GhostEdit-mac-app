@@ -46,17 +46,20 @@ enum DiffSupport
 
 ## HUDOverlaySupport.swift
 ```
-enum HUDOverlayState: Equatable  - .working, .success, .successWithCount(Int), .error(String)
+enum HUDOverlayState: Equatable  - .working, .success, .successWithCount(Int), .successWithDiff([DiffSegment], toolsUsed: String), .error(String), .fallback
 struct HUDOverlayContent: Equatable  - emoji: String, message: String
 
 enum HUDOverlaySupport
   // Layout: windowWidth/Height, cornerRadius, iconSize, messageFontSize, verticalSpacing, contentInset
-  // Timing: fadeInDuration, fadeOutDuration, workingAutoDismissDelay, successAutoDismissDelay, errorAutoDismissDelay
+  // Timing: fadeInDuration, fadeOutDuration, successAutoDismissDelay
   // Ghost SVG: ghostBodyPath, ghostMouthPath, ghostBridgePath, ghostLeftArmPath, ghostRightArmPath
   // Eyes: GhostEye struct, ghostLeftEye, ghostRightEye
   static content(for:) -> HUDOverlayContent
   static showsSpectacles(for:) -> Bool
-  static autoDismissDelay(for:) -> TimeInterval?
+  static autoDismissDelay(for:) -> TimeInterval?  // nil for working, corrections, failures
+  static diffPanelHeight(intrinsicContentHeight:, visibleFrameHeight:) -> CGFloat
+  struct OriginalDiffDisplay  // unchanged original text + UTF-16 deletion/insertion-anchor ranges
+  static originalDiffDisplay(from:) -> OriginalDiffDisplay
   static windowOrigin(screenSize:) -> CGPoint
 ```
 

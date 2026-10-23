@@ -28,9 +28,8 @@ enum HUDOverlaySupport {
     // Timing
     static let fadeInDuration: CGFloat = 0.18
     static let fadeOutDuration: CGFloat = 0.25
-    static let workingAutoDismissDelay: TimeInterval = 1.0
+    /// Brief confirmation fade. Corrections and failures are sticky instead.
     static let successAutoDismissDelay: TimeInterval = 1.0
-    static let errorAutoDismissDelay: TimeInterval = 2.5
 
     // Diff overlay layout
     static let diffWindowWidth: CGFloat = 360
@@ -38,7 +37,6 @@ enum HUDOverlaySupport {
     static let diffFontSize: CGFloat = 12
     static let diffContentInset: CGFloat = 12
     static let diffIconSize: CGFloat = 40
-    static let diffAutoDismissDelay: TimeInterval = 5.0
 
     static let defaultErrorMessage = "Something went wrong"
 
@@ -106,18 +104,106 @@ enum HUDOverlaySupport {
         }
     }
 
+    /// Automatic fade delay for brief confirmations. Loading, correction, and
+    /// failure states return nil because they stay until the next transition or
+    /// until the user interacts outside the panel.
     static func autoDismissDelay(for state: HUDOverlayState) -> TimeInterval? {
         switch state {
-        case .working:
-            return workingAutoDismissDelay
         case .success, .successWithCount, .fallback:
             return successAutoDismissDelay
-        case .successWithDiff:
-            return diffAutoDismissDelay
-        case .error:
-            return errorAutoDismissDelay
+        case .working, .successWithDiff, .error:
+            return nil
         }
     }
+
+    /// Height for the correction overlay. Compact content uses the standard
+    /// size, longer content may grow modestly, and the result is bounded by the
+    /// visible screen; overflow scrolls inside the text views.
+    static func diffPanelHeight(
+        intrinsicContentHeight: CGFloat,
+        visibleFrameHeight: CGFloat
+    ) -> CGFloat {
+        let compactMinimum: CGFloat = 220
+        let screenBound = max(compactMinimum, visibleFrameHeight - 60)
+        let growthBound = min(screenBound, diffWindowMaxHeight * 1.5)
+        return min(max(intrinsicContentHeight, compactMinimum), growthBound)
+    }
+
+    /// Original-side rendering data for a correction.
+    struct OriginalDiffDisplay {
+        /// Original text, unchanged: only equal and deletion segments contribute.
+        let text: String
+        /// UTF-16 ranges of removed text, drawn with a red underline.
+        let deletionRanges: [NSRange]
+        /// UTF-16 ranges of adjacent original characters anchoring pure
+        /// insertions that have no removed span to underline.
+        let insertionAnchorRanges: [NSRange]
+    }
+
+    /// Build the original text and its highlight ranges without mutating it.
+    /// Deletions are underlined directly; pure insertions underline the closest
+    /// composed character (or punctuation) immediately before or after them.
+    static func originalDiffDisplay(from segments: [DiffSegment]) -> OriginalDiffDisplay {
+        var text = ""
+        var offset = 0
+        var pieces: [(kind: DiffSegmentKind, range: NSRange)] = []
+        var insertionIndices: [Int] = []
+        var deletionRanges: [NSRange] = []
+
+        for segment in segments {
+            switch segment.kind {
+            case .insertion:
+                insertionIndices.append(pieces.count)
+            case .equal, .deletion:
+                let length = (segment.text as NSString).length
+                let range = NSRange(location: offset, length: length)
+                pieces.append((kind: segment.kind, range: range))
+                if segment.kind == .deletion, length > 0 {
+                    deletionRanges.append(range)
+                }
+                text += segment.text
+                offset += length
+            }
+        }
+
+        let textBridge = text as NSString
+        var anchorRanges: [NSRange] = []
+        for index in insertionIndices {
+            let previous: (kind: DiffSegmentKind, range: NSRange)? =
+                index > 0 ? pieces[index - 1] : nil
+            let next: (kind: DiffSegmentKind, range: NSRange)? =
+                index < pieces.count ? pieces[index] : nil
+
+            if let previous, previous.kind == .deletion, previous.range.length > 0 {
+                continue
+            }
+            if let next, next.kind == .deletion, next.range.length > 0 {
+                continue
+            }
+
+            var anchorRange: NSRange?
+            if let previous, previous.kind == .equal, previous.range.length > 0 {
+                anchorRange = textBridge.rangeOfComposedCharacterSequence(
+                    at: NSMaxRange(previous.range) - 1
+                )
+            } else if let next, next.kind == .equal, next.range.length > 0 {
+                anchorRange = textBridge.rangeOfComposedCharacterSequence(
+                    at: next.range.location
+                )
+            }
+
+            if let anchorRange, !anchorRanges.contains(anchorRange) {
+                anchorRanges.append(anchorRange)
+            }
+        }
+
+        return OriginalDiffDisplay(
+            text: text,
+            deletionRanges: deletionRanges,
+            insertionAnchorRanges: anchorRanges
+        )
+    }
+
 
     static func windowOrigin(screenSize: CGSize) -> CGPoint {
         let x = (screenSize.width - windowWidth) / 2

@@ -113,8 +113,8 @@ final class ClaudeRuntimeSupportTests: XCTestCase {
         XCTAssertEqual(stderr, "stdout details")
     }
 
-    func testCLIArgumentsForClaudeIncludesModelWhenProvided() {
-        let args = ClaudeRuntimeSupport.cliArguments(
+    func testCLIArgumentsForClaudeIncludesModelWhenProvided() throws {
+        let args = try ClaudeRuntimeSupport.cliArguments(
             provider: .claude,
             prompt: "prompt",
             model: "haiku"
@@ -132,8 +132,8 @@ final class ClaudeRuntimeSupportTests: XCTestCase {
         ])
     }
 
-    func testCLIArgumentsForClaudeOmitsModelWhenBlank() {
-        let args = ClaudeRuntimeSupport.cliArguments(
+    func testCLIArgumentsForClaudeOmitsModelWhenBlank() throws {
+        let args = try ClaudeRuntimeSupport.cliArguments(
             provider: .claude,
             prompt: "prompt",
             model: "   "
@@ -149,13 +149,13 @@ final class ClaudeRuntimeSupportTests: XCTestCase {
         ])
     }
 
-    func testCLIArgumentsForCodex() {
-        let withModel = ClaudeRuntimeSupport.cliArguments(
+    func testCLIArgumentsForCodex() throws {
+        let withModel = try ClaudeRuntimeSupport.cliArguments(
             provider: .codex,
             prompt: "hello",
             model: "gpt-5-codex"
         )
-        let withoutModel = ClaudeRuntimeSupport.cliArguments(
+        let withoutModel = try ClaudeRuntimeSupport.cliArguments(
             provider: .codex,
             prompt: "hello",
             model: "   "
@@ -183,13 +183,13 @@ final class ClaudeRuntimeSupportTests: XCTestCase {
         ])
     }
 
-    func testCLIArgumentsForGemini() {
-        let withModel = ClaudeRuntimeSupport.cliArguments(
+    func testCLIArgumentsForGemini() throws {
+        let withModel = try ClaudeRuntimeSupport.cliArguments(
             provider: .gemini,
             prompt: "hello",
             model: "gemini-2.5-flash"
         )
-        let withoutModel = ClaudeRuntimeSupport.cliArguments(
+        let withoutModel = try ClaudeRuntimeSupport.cliArguments(
             provider: .gemini,
             prompt: "hello",
             model: ""
@@ -211,12 +211,12 @@ final class ClaudeRuntimeSupportTests: XCTestCase {
         ])
     }
 
-    func testClaudeWrapperFunctionsMapToGenericHelpers() {
+    func testClaudeWrapperFunctionsMapToGenericHelpers() throws {
         let searchPaths = ClaudeRuntimeSupport.claudeSearchPaths(
             homeDirectoryPath: "/Users/example",
             environment: ["PATH": "/custom/bin"]
         )
-        let args = ClaudeRuntimeSupport.claudeArguments(prompt: "p", model: "haiku")
+        let args = try ClaudeRuntimeSupport.claudeArguments(prompt: "p", model: "haiku")
 
         XCTAssertTrue(searchPaths.contains("/custom/bin/claude"))
         XCTAssertEqual(args, [
@@ -229,5 +229,15 @@ final class ClaudeRuntimeSupportTests: XCTestCase {
             "--model",
             "haiku"
         ])
+    }
+
+    func testHTTPProviderCannotBeLaunchedAsACloudCLI() {
+        XCTAssertThrowsError(try ClaudeRuntimeSupport.cliArguments(
+            provider: .ollama, prompt: "Private text", model: "qwen3:1.7b"
+        )) { error in
+            guard case ClaudeRuntimeSupport.InvocationError.httpProvider = error else {
+                return XCTFail("HTTP corrections must reject accidental CLI dispatch, got \(error)")
+            }
+        }
     }
 }

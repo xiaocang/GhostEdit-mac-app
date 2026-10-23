@@ -1,0 +1,4 @@
+module CHarperBridge {
+    header "harper_bridge.h"
+    export *
+}

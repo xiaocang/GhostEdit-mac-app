@@ -4,81 +4,69 @@ enum CLIProvider: String, Codable, CaseIterable {
     case claude
     case codex
     case gemini
+    case ollama
 
     static let `default`: CLIProvider = .claude
 
-    var displayName: String {
+    private struct Metadata {
+        let displayName: String
+        let authCommand: String
+        let configPathKey: String
+        let availableModels: [String]
+        let defaultModel: String
+    }
+
+    private static let claudeMetadata = Metadata(
+        displayName: "Claude",
+        authCommand: "claude auth login",
+        configPathKey: "claudePath",
+        availableModels: [
+            "claude-haiku-4-5", "claude-sonnet-4-5", "claude-sonnet-4-6",
+            "claude-opus-4-6", "haiku", "sonnet", "opus"
+        ],
+        defaultModel: "claude-haiku-4-5"
+    )
+    private static let codexMetadata = Metadata(
+        displayName: "Codex",
+        authCommand: "codex login",
+        configPathKey: "codexPath",
+        availableModels: ["gpt-5-codex", "gpt-5.3-codex", "gpt-5"],
+        defaultModel: "gpt-5-codex"
+    )
+    private static let geminiMetadata = Metadata(
+        displayName: "Gemini",
+        authCommand: "gemini",
+        configPathKey: "geminiPath",
+        availableModels: [
+            "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro",
+            "gemini-3-flash-preview", "gemini-3-pro-preview",
+            "gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools"
+        ],
+        defaultModel: "gemini-2.5-flash-lite"
+    )
+    private static let ollamaMetadata = Metadata(
+        displayName: "Ollama (Local)",
+        authCommand: "ollama serve",
+        configPathKey: "ollamaBaseURL",
+        availableModels: ["qwen3:1.7b", "qwen3:0.6b"],
+        defaultModel: "qwen3:1.7b"
+    )
+
+    private var metadata: Metadata {
         switch self {
-        case .claude:
-            return "Claude"
-        case .codex:
-            return "Codex"
-        case .gemini:
-            return "Gemini"
+        case .claude: return Self.claudeMetadata
+        case .codex: return Self.codexMetadata
+        case .gemini: return Self.geminiMetadata
+        case .ollama: return Self.ollamaMetadata
         }
     }
 
     var executableName: String { rawValue }
-
-    var authCommand: String {
-        switch self {
-        case .claude:
-            return "claude auth login"
-        case .codex:
-            return "codex login"
-        case .gemini:
-            return "gemini"
-        }
-    }
-
-    var configPathKey: String {
-        switch self {
-        case .claude:
-            return "claudePath"
-        case .codex:
-            return "codexPath"
-        case .gemini:
-            return "geminiPath"
-        }
-    }
-
-    var availableModels: [String] {
-        switch self {
-        case .claude:
-            return [
-                "claude-haiku-4-5",
-                "claude-sonnet-4-5",
-                "claude-sonnet-4-6",
-                "claude-opus-4-6",
-                "haiku",
-                "sonnet",
-                "opus"
-            ]
-        case .codex:
-            return ["gpt-5-codex", "gpt-5.3-codex", "gpt-5"]
-        case .gemini:
-            return [
-                "gemini-2.5-flash-lite",
-                "gemini-2.5-flash",
-                "gemini-2.5-pro",
-                "gemini-3-flash-preview",
-                "gemini-3-pro-preview",
-                "gemini-3.1-pro-preview",
-                "gemini-3.1-pro-preview-customtools"
-            ]
-        }
-    }
-
-    var defaultModel: String {
-        switch self {
-        case .claude:
-            return "claude-haiku-4-5"
-        case .codex:
-            return "gpt-5-codex"
-        case .gemini:
-            return "gemini-2.5-flash-lite"
-        }
-    }
+    var displayName: String { metadata.displayName }
+    var authCommand: String { metadata.authCommand }
+    var configPathKey: String { metadata.configPathKey }
+    var availableModels: [String] { metadata.availableModels }
+    var defaultModel: String { metadata.defaultModel }
 }
 
 struct AppConfig: Codable, Equatable {
@@ -107,6 +95,7 @@ struct AppConfig: Codable, Equatable {
     var localModelPythonPath: String
     var cloudHotkeyKeyCode: UInt32
     var cloudHotkeyModifiers: UInt32
+    var ollamaBaseURL: String
 
     static let `default` = AppConfig(
         claudePath: "",
@@ -217,6 +206,7 @@ struct AppConfig: Codable, Equatable {
         case localModelPythonPath
         case cloudHotkeyKeyCode
         case cloudHotkeyModifiers
+        case ollamaBaseURL
     }
 
     init(
@@ -244,7 +234,8 @@ struct AppConfig: Codable, Equatable {
         localModelPromptTemplates: String = "{}",
         localModelPythonPath: String = "",
         cloudHotkeyKeyCode: UInt32 = 14,
-        cloudHotkeyModifiers: UInt32 = 768
+        cloudHotkeyModifiers: UInt32 = 768,
+        ollamaBaseURL: String = "http://127.0.0.1:11434"
     ) {
         self.claudePath = claudePath
         self.codexPath = codexPath
@@ -271,6 +262,7 @@ struct AppConfig: Codable, Equatable {
         self.localModelPythonPath = localModelPythonPath
         self.cloudHotkeyKeyCode = cloudHotkeyKeyCode
         self.cloudHotkeyModifiers = cloudHotkeyModifiers
+        self.ollamaBaseURL = ollamaBaseURL
     }
 
     init(from decoder: Decoder) throws {
@@ -301,6 +293,7 @@ struct AppConfig: Codable, Equatable {
         localModelPythonPath = try container.decodeIfPresent(String.self, forKey: .localModelPythonPath) ?? AppConfig.default.localModelPythonPath
         cloudHotkeyKeyCode = try container.decodeIfPresent(UInt32.self, forKey: .cloudHotkeyKeyCode) ?? hotkeyKeyCode
         cloudHotkeyModifiers = try container.decodeIfPresent(UInt32.self, forKey: .cloudHotkeyModifiers) ?? (hotkeyModifiers | 512)
+        ollamaBaseURL = try container.decodeIfPresent(String.self, forKey: .ollamaBaseURL) ?? AppConfig.default.ollamaBaseURL
     }
 
     var resolvedClaudePath: String? {
@@ -329,6 +322,8 @@ struct AppConfig: Codable, Equatable {
             value = codexPath
         case .gemini:
             value = geminiPath
+        case .ollama:
+            return nil
         }
 
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -509,7 +504,8 @@ final class ConfigManager {
             localModelPromptTemplates: normalizedPromptTemplates,
             localModelPythonPath: config.localModelPythonPath,
             cloudHotkeyKeyCode: config.cloudHotkeyKeyCode,
-            cloudHotkeyModifiers: config.cloudHotkeyModifiers
+            cloudHotkeyModifiers: config.cloudHotkeyModifiers,
+            ollamaBaseURL: config.ollamaBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         )
     }
 

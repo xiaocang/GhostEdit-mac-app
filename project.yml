@@ -15,6 +15,10 @@ targets:
       - path: GhostEdit/Sources
         excludes:
           - main.swift
+    preBuildScripts:
+      - name: Build Harper bridge
+        script: /bin/bash "$SRCROOT/scripts/build_harper.sh"
+        basedOnDependencyAnalysis: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ghostedit.core

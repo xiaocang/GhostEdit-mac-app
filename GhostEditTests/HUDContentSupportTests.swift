@@ -91,7 +91,7 @@ final class HUDContentSupportTests: XCTestCase {
 
     func testEffectiveDismissDelayNoOverrideWorking() {
         let delay = HUDContentSupport.effectiveDismissDelay(override: nil, state: .working)
-        XCTAssertEqual(delay, HUDOverlaySupport.workingAutoDismissDelay)
+        XCTAssertNil(delay)
     }
 
     func testEffectiveDismissDelayNoOverrideSuccess() {
@@ -101,12 +101,12 @@ final class HUDContentSupportTests: XCTestCase {
 
     func testEffectiveDismissDelayNoOverrideError() {
         let delay = HUDContentSupport.effectiveDismissDelay(override: nil, state: .error("err"))
-        XCTAssertEqual(delay, HUDOverlaySupport.errorAutoDismissDelay)
+        XCTAssertNil(delay)
     }
 
     func testEffectiveDismissDelayNoOverrideDiff() {
         let delay = HUDContentSupport.effectiveDismissDelay(override: nil, state: .successWithDiff([], toolsUsed: ""))
-        XCTAssertEqual(delay, HUDOverlaySupport.diffAutoDismissDelay)
+        XCTAssertNil(delay)
     }
 
     func testEffectiveDismissDelayNoOverrideFallback() {
