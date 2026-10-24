@@ -109,4 +109,40 @@ enum WidgetPositioningSupport {
         }
         return updated
     }
+
+    /// Convert an Accessibility top-left screen rect into AppKit bottom-left coordinates.
+    static func appKitRect(fromAccessibility rect: CGRect, primaryScreenHeight: CGFloat) -> CGRect {
+        CGRect(
+            x: rect.origin.x,
+            y: primaryScreenHeight - rect.origin.y - rect.height,
+            width: rect.width,
+            height: rect.height
+        )
+    }
+
+    /// Place a floater just under the selection, left-aligned, and keep it on the visible screen.
+    static func floaterOrigin(
+        anchor: CGRect,
+        panelSize: CGSize,
+        visibleFrame: CGRect,
+        gap: CGFloat = 4
+    ) -> CGPoint {
+        var origin = CGPoint(x: anchor.minX, y: anchor.minY - gap - panelSize.height)
+        if origin.y < visibleFrame.minY {
+            origin.y = anchor.maxY + gap
+        }
+        if origin.x + panelSize.width > visibleFrame.maxX {
+            origin.x = visibleFrame.maxX - panelSize.width
+        }
+        if origin.x < visibleFrame.minX {
+            origin.x = visibleFrame.minX
+        }
+        if origin.y + panelSize.height > visibleFrame.maxY {
+            origin.y = visibleFrame.maxY - panelSize.height
+        }
+        if origin.y < visibleFrame.minY {
+            origin.y = visibleFrame.minY
+        }
+        return origin
+    }
 }

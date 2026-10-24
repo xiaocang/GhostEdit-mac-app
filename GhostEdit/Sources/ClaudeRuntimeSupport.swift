@@ -77,6 +77,7 @@ enum ClaudeRuntimeSupport {
             || normalized.contains("authentication_error")
             || normalized.contains("token has expired")
             || normalized.contains("oauth token")
+            || normalized.contains("not authenticated")
             || normalized.contains("\(provider.executableName) login")
             || normalized.contains("\(provider.executableName) auth login")
             || normalized.contains("api error: 401")
@@ -133,7 +134,25 @@ enum ClaudeRuntimeSupport {
                 args.append(contentsOf: ["--model", trimmedModel])
             }
             return args
-        case .ollama:
+        case .grok:
+            var args = [
+                "--no-auto-update",
+                "--no-alt-screen",
+                "-p",
+                prompt,
+                "--output-format",
+                "plain",
+                "--max-turns",
+                "1",
+                "--no-plan",
+                "--no-subagents",
+                "--disable-web-search"
+            ]
+            if !trimmedModel.isEmpty {
+                args.append(contentsOf: ["-m", trimmedModel])
+            }
+            return args
+        case .ollama, .magpie:
             throw InvocationError.httpProvider
         }
     }

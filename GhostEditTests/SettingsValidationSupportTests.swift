@@ -40,60 +40,11 @@ final class SettingsValidationSupportTests: XCTestCase {
     func testHotkeyModifiersZeroFails() {
         let error = SettingsValidationSupport.validateHotkeyModifiers(0)
         XCTAssertNotNil(error)
-        XCTAssertEqual(error?.title, "Local hotkey modifiers are required")
+        XCTAssertEqual(error?.title, "Hotkey modifiers are required")
     }
 
     func testHotkeyModifiersNonZeroPasses() {
         XCTAssertNil(SettingsValidationSupport.validateHotkeyModifiers(256))
-    }
-
-    // MARK: - validateCloudHotkeyKeyCode
-
-    func testCloudHotkeyKeyCodeNilFails() {
-        let error = SettingsValidationSupport.validateCloudHotkeyKeyCode(nil)
-        XCTAssertNotNil(error)
-        XCTAssertEqual(error?.title, "Cloud hotkey key is required")
-    }
-
-    func testCloudHotkeyKeyCodeValidPasses() {
-        XCTAssertNil(SettingsValidationSupport.validateCloudHotkeyKeyCode(14))
-    }
-
-    // MARK: - validateCloudHotkeyModifiers
-
-    func testCloudHotkeyModifiersZeroFails() {
-        let error = SettingsValidationSupport.validateCloudHotkeyModifiers(0)
-        XCTAssertNotNil(error)
-        XCTAssertEqual(error?.title, "Cloud hotkey modifiers are required")
-    }
-
-    func testCloudHotkeyModifiersNonZeroPasses() {
-        XCTAssertNil(SettingsValidationSupport.validateCloudHotkeyModifiers(256))
-    }
-
-    // MARK: - validateHotkeysNotDuplicate
-
-    func testDuplicateHotkeysFails() {
-        let error = SettingsValidationSupport.validateHotkeysNotDuplicate(
-            localKeyCode: 14, localModifiers: 256,
-            cloudKeyCode: 14, cloudModifiers: 256
-        )
-        XCTAssertNotNil(error)
-        XCTAssertEqual(error?.title, "Hotkeys must be different")
-    }
-
-    func testDifferentKeyCodesPasses() {
-        XCTAssertNil(SettingsValidationSupport.validateHotkeysNotDuplicate(
-            localKeyCode: 14, localModifiers: 256,
-            cloudKeyCode: 15, cloudModifiers: 256
-        ))
-    }
-
-    func testDifferentModifiersPasses() {
-        XCTAssertNil(SettingsValidationSupport.validateHotkeysNotDuplicate(
-            localKeyCode: 14, localModifiers: 256,
-            cloudKeyCode: 14, cloudModifiers: 512
-        ))
     }
 
     // MARK: - validateHistoryLimit
@@ -150,89 +101,39 @@ final class SettingsValidationSupportTests: XCTestCase {
         } else { XCTFail("Expected failure") }
     }
 
-    // MARK: - validateDiffPreviewDuration
-
-    func testDurationValid() {
-        if case .success(let v) = SettingsValidationSupport.validateDiffPreviewDuration("10") {
-            XCTAssertEqual(v, 10)
-        } else { XCTFail("Expected success") }
-    }
-
-    func testDurationLowerBound() {
-        if case .success(let v) = SettingsValidationSupport.validateDiffPreviewDuration("1") {
-            XCTAssertEqual(v, 1)
-        } else { XCTFail("Expected success") }
-    }
-
-    func testDurationUpperBound() {
-        if case .success(let v) = SettingsValidationSupport.validateDiffPreviewDuration("30") {
-            XCTAssertEqual(v, 30)
-        } else { XCTFail("Expected success") }
-    }
-
-    func testDurationTooLowFails() {
-        if case .failure(let e) = SettingsValidationSupport.validateDiffPreviewDuration("0") {
-            XCTAssertEqual(e.title, "Popup duration is invalid")
-        } else { XCTFail("Expected failure") }
-    }
-
-    func testDurationTooHighFails() {
-        if case .failure = SettingsValidationSupport.validateDiffPreviewDuration("31") {
-        } else { XCTFail("Expected failure") }
-    }
-
-    func testDurationNonNumericFails() {
-        if case .failure = SettingsValidationSupport.validateDiffPreviewDuration("abc") {
-        } else { XCTFail("Expected failure") }
-    }
-
     // MARK: - validateAll
 
     func testValidateAllSuccess() {
         let result = SettingsValidationSupport.validateAll(
             hotkeyKeyCode: 14, hotkeyModifiers: 256,
-            cloudHotkeyKeyCode: 14, cloudHotkeyModifiers: 768,
             selectedOptionValue: "model", customModel: "claude-3",
-            historyLimitText: "100", timeoutText: "30", diffPreviewDurationText: "5"
+            historyLimitText: "100", timeoutText: "30"
         )
         if case .success(let settings) = result {
             XCTAssertEqual(settings.hotkeyKeyCode, 14)
+            XCTAssertEqual(settings.hotkeyModifiers, 256)
+            XCTAssertEqual(settings.model, "claude-3")
             XCTAssertEqual(settings.historyLimit, 100)
             XCTAssertEqual(settings.timeoutSeconds, 30)
-            XCTAssertEqual(settings.diffPreviewDuration, 5)
         } else { XCTFail("Expected success") }
     }
 
     func testValidateAllFailsOnFirstError() {
         let result = SettingsValidationSupport.validateAll(
             hotkeyKeyCode: nil, hotkeyModifiers: 256,
-            cloudHotkeyKeyCode: 14, cloudHotkeyModifiers: 256,
             selectedOptionValue: "model", customModel: "claude-3",
-            historyLimitText: "100", timeoutText: "30", diffPreviewDurationText: "5"
+            historyLimitText: "100", timeoutText: "30"
         )
         if case .failure(let error) = result {
             XCTAssertEqual(error.title, "Hotkey key is required")
         } else { XCTFail("Expected failure") }
     }
 
-    func testValidateAllFailsOnDuplicate() {
-        let result = SettingsValidationSupport.validateAll(
-            hotkeyKeyCode: 14, hotkeyModifiers: 256,
-            cloudHotkeyKeyCode: 14, cloudHotkeyModifiers: 256,
-            selectedOptionValue: "model", customModel: "claude-3",
-            historyLimitText: "100", timeoutText: "30", diffPreviewDurationText: "5"
-        )
-        if case .failure(let error) = result {
-            XCTAssertEqual(error.title, "Hotkeys must be different")
-        } else { XCTFail("Expected failure") }
-    }
-
     func testValidateAllFailsOnTimeout() {
         let result = SettingsValidationSupport.validateAll(
             hotkeyKeyCode: 14, hotkeyModifiers: 256,
-            cloudHotkeyKeyCode: 15, cloudHotkeyModifiers: 256,
             selectedOptionValue: "model", customModel: "claude-3",
-            historyLimitText: "100", timeoutText: "2", diffPreviewDurationText: "5"
+            historyLimitText: "100", timeoutText: "2"
         )
         if case .failure(let error) = result {
             XCTAssertEqual(error.title, "Timeout is invalid")

@@ -62,8 +62,7 @@ final class FloatingPanelDismissMonitor {
             guard self?.generation == currentGeneration else { return }
             onOutsideInteraction()
         }
-        let events: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown,
-                                            .keyDown, .scrollWheel]
+        let events: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: events) { [weak window] event in
             if let window, event.window !== window {
                 handleOutside()
@@ -72,14 +71,6 @@ final class FloatingPanelDismissMonitor {
         }
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: events) { _ in
             handleOutside()
-        }
-        activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
-        ) { notification in
-            if let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-               app.processIdentifier != ProcessInfo.processInfo.processIdentifier {
-                handleOutside()
-            }
         }
     }
 

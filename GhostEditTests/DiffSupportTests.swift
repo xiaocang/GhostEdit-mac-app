@@ -219,4 +219,49 @@ final class DiffSupportTests: XCTestCase {
         XCTAssertEqual(segments.first?.kind, .insertion)
         XCTAssertEqual(segments.first?.text, "abc")
     }
+
+    func testCompactChangedSegmentsKeepsShortContext() {
+        let segments = [
+            DiffSegment(kind: .equal, text: "Hello "),
+            DiffSegment(kind: .deletion, text: "world"),
+            DiffSegment(kind: .insertion, text: "there"),
+        ]
+        let compact = DiffSupport.compactChangedSegments(segments, contextCharacters: 12)
+        XCTAssertEqual(compact.map(\.text), ["Hello ", "world", "there"])
+    }
+
+    func testCompactChangedSegmentsTruncatesLongEqualRuns() {
+        let segments = [
+            DiffSegment(kind: .equal, text: "prefix-context "),
+            DiffSegment(kind: .deletion, text: "old"),
+            DiffSegment(kind: .insertion, text: "new"),
+            DiffSegment(kind: .equal, text: " and a long unchanged tail"),
+        ]
+        let compact = DiffSupport.compactChangedSegments(segments, contextCharacters: 4)
+        XCTAssertEqual(compact.first?.text, "…ext ")
+        XCTAssertEqual(compact.last?.text, " and…")
+        XCTAssertEqual(compact.filter { $0.kind != .equal }.map(\.text), ["old", "new"])
+    }
+
+    func testCompactChangedSegmentsClampsNegativeContext() {
+        let segments = [DiffSegment(kind: .equal, text: "abcdef"), DiffSegment(kind: .insertion, text: "x")]
+        let compact = DiffSupport.compactChangedSegments(segments, contextCharacters: -3)
+        XCTAssertEqual(compact.map(\.text), ["…", "x"])
+    }
+
+    func testCompactChangedSegmentsSplitsContextAroundAMiddleChange() {
+        let segments = [
+            DiffSegment(kind: .deletion, text: "old"),
+            DiffSegment(kind: .equal, text: " unchanged middle text "),
+            DiffSegment(kind: .insertion, text: "new"),
+        ]
+        let compact = DiffSupport.compactChangedSegments(segments, contextCharacters: 4)
+        XCTAssertEqual(compact.map(\.text), ["old", " unc…", "…ext ", "new"])
+    }
+
+    func testCompactChangedSegmentsLeavesUnchangedTextIntact() {
+        let segments = [DiffSegment(kind: .equal, text: "same")]
+        XCTAssertEqual(DiffSupport.compactChangedSegments(segments).map(\.text), ["same"])
+    }
 }
+

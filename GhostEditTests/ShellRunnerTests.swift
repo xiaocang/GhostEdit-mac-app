@@ -19,7 +19,8 @@ final class ShellRunnerTests: XCTestCase {
             let payload = try stub.requestJSON()
             let messages = try XCTUnwrap(payload["messages"] as? [[String: String]])
             XCTAssertEqual(messages.count, 2)
-            XCTAssertTrue(messages[0]["content"]?.contains("Respond in French") == true)
+            XCTAssertTrue(messages[0]["content"]?.contains("Translate the user text into French") == true)
+            XCTAssertTrue(messages[0]["content"]?.contains("<<<TEXT>>>") == true)
             XCTAssertTrue(messages[0]["content"]?.contains("GHOSTEDIT_KEEP") == true)
             XCTAssertTrue(messages[1]["content"]?.contains("__GHOSTEDIT_KEEP_0__") == true)
             XCTAssertEqual(payload["model"] as? String, "qwen3:0.6b")
@@ -52,6 +53,120 @@ final class ShellRunnerTests: XCTestCase {
         wait(for: [delivered], timeout: 2)
         XCTAssertEqual(stale.sendCallCount, 0)
         XCTAssertEqual(stale.streamCallCount, 0)
+    }
+
+    func testMagpieCorrectionsUseTheLocalGateway() throws {
+        let testEnv = try makeRunnerEnvironment()
+        let (url, configuration) = OllamaURLProtocol.stub { stub in
+            XCTAssertEqual(stub.request.url?.path, "/v1/chat/completions")
+            XCTAssertEqual(stub.request.value(forHTTPHeaderField: "Authorization"), "Bearer magpie")
+            let payload = try stub.requestJSON()
+            XCTAssertEqual(payload["model"] as? String, "claude/claude-haiku-4-5")
+            let data = try JSONSerialization.data(withJSONObject: [
+                "choices": [["message": ["content": "corrected"]]]
+            ])
+            stub.respond(chunks: [data])
+        }
+        var config = AppConfig.default.withProvider(.magpie, executablePath: "", model: "claude/claude-haiku-4-5")
+        config.magpieBaseURL = url
+        try testEnv.manager.saveConfig(config)
+        let runner = ShellRunner(configManager: testEnv.manager, environment: [:],
+                                 ollamaSessionConfiguration: configuration)
+        XCTAssertEqual(try runner.correctText(systemPrompt: "Fix", selectedText: "text"), "corrected")
+    }
+
+    func testOllamaStripsTheFencedCorrectionAndLeavesUnfencedTextAlone() throws {
+        let fenced = OllamaURLProtocol.stub { stub in
+            stub.respond(chunks: [Data(#"{"message":{"content":"notes\n<<<TEXT>>>\nHello — there\n<<<END>>>\nbye"},"done":true}"#.utf8)])
+        }
+        let testEnv = try makeRunnerEnvironment()
+        var config = AppConfig.default.withProvider(.ollama, executablePath: "", model: "qwen3:0.6b")
+        config.ollamaBaseURL = fenced.0
+        config.language = "en"
+        try testEnv.manager.saveConfig(config)
+        let runner = ShellRunner(configManager: testEnv.manager, environment: [:],
+                                 ollamaSessionConfiguration: fenced.1)
+        XCTAssertEqual(try runner.correctText(systemPrompt: "Fix", selectedText: "原文"), "Hello — there")
+
+        let raw = OllamaURLProtocol.stub { stub in
+            stub.respond(chunks: [Data(#"{"message":{"content":"Bonjour — kept"},"done":true}"#.utf8)])
+        }
+        config.ollamaBaseURL = raw.0
+        try testEnv.manager.saveConfig(config)
+        let rawRunner = ShellRunner(configManager: testEnv.manager, environment: [:],
+                                    ollamaSessionConfiguration: raw.1)
+        XCTAssertEqual(
+            try rawRunner.correctText(systemPrompt: "Return JSON", selectedText: "samples", includeLanguageContract: false),
+            "Bonjour — kept"
+        )
+    }
+
+    func testOllamaSendsTheSelectedTextAndDemandsEnglishInTheSystemPrompt() throws {
+        let source = "大家如果有需要其他组同事周末在线的，share一下 名字"
+        let stub = OllamaURLProtocol.stub { stub in
+            let payload = try stub.requestJSON()
+            let messages = try XCTUnwrap(payload["messages"] as? [[String: String]])
+            let system = try XCTUnwrap(messages[0]["content"])
+            XCTAssertTrue(system.contains("Target language: English. Translate the user text into English. If it is already English, correct the grammar. Do not return the original language."))
+            XCTAssertTrue(system.contains("<<<TEXT>>>"))
+            XCTAssertEqual(messages[1]["content"], "<selected>\n\(source)\n</selected>")
+            stub.respond(chunks: [Data(#"{"message":{"content":"If anyone needs colleagues online this weekend, share the name."},"done":true}"#.utf8)])
+        }
+        let testEnv = try makeRunnerEnvironment()
+        var config = AppConfig.default.withProvider(.ollama, executablePath: "", model: "qwen3:1.7b")
+        config.ollamaBaseURL = stub.0
+        config.language = "en"
+        try testEnv.manager.saveConfig(config)
+        let runner = ShellRunner(configManager: testEnv.manager, environment: [:],
+                                 ollamaSessionConfiguration: stub.1)
+        XCTAssertEqual(
+            try runner.correctText(systemPrompt: "Fix", selectedText: source),
+            "If anyone needs colleagues online this weekend, share the name."
+        )
+    }
+    func testOllamaSendsAModelSwitchInsideTheSelectedTag() throws {
+        let source = "历史里改正结果同一行末尾还挂着 /no_think。整行过滤抓不到，我把它从正文里剥掉。"
+        XCTAssertEqual(
+            ShellRunner.correctionOnly(in: "<selected>\nIn history, the line still says /no_think.\n</selected> /no_think"),
+            "In history, the line still says /no_think."
+        )
+        let stub = OllamaURLProtocol.stub { stub in
+            let payload = try stub.requestJSON()
+            let messages = try XCTUnwrap(payload["messages"] as? [[String: String]])
+            XCTAssertEqual(messages[1]["content"], "<selected>\n\(source)\n</selected>")
+            XCTAssertFalse(messages[1]["content"]?.contains("NO_THINK") == true)
+            stub.respond(chunks: [Data(#"{"message":{"content":"<selected>\nIn history, the line still says /no_think.\n</selected>"},"done":true}"#.utf8)])
+        }
+        let testEnv = try makeRunnerEnvironment()
+        var config = AppConfig.default.withProvider(.ollama, executablePath: "", model: "qwen3:1.7b")
+        config.ollamaBaseURL = stub.0
+        config.language = "en"
+        try testEnv.manager.saveConfig(config)
+        let runner = ShellRunner(configManager: testEnv.manager, environment: [:],
+                                 ollamaSessionConfiguration: stub.1)
+        XCTAssertEqual(
+            try runner.correctText(systemPrompt: "Fix", selectedText: source),
+            "In history, the line still says /no_think."
+        )
+    }
+
+
+    func testOllamaRejectsAnEmptyFencedCorrection() throws {
+        let stub = OllamaURLProtocol.stub { stub in
+            stub.respond(chunks: [Data(#"{"message":{"content":"notes\n<<<TEXT>>>\n\n<<<END>>>\nbye"},"done":true}"#.utf8)])
+        }
+        let testEnv = try makeRunnerEnvironment()
+        var config = AppConfig.default.withProvider(.ollama, executablePath: "", model: "qwen3:0.6b")
+        config.ollamaBaseURL = stub.0
+        try testEnv.manager.saveConfig(config)
+        let runner = ShellRunner(configManager: testEnv.manager, environment: [:],
+                                 ollamaSessionConfiguration: stub.1)
+        XCTAssertThrowsError(try runner.correctText(systemPrompt: "Fix", selectedText: "原文")) { error in
+            guard case ShellRunnerError.emptyResponse = error else {
+                XCTFail("Expected emptyResponse, got \(error)")
+                return
+            }
+        }
     }
 
     func testNonClaudeProvidersNeverUseReadyClaudeSession() throws {
@@ -138,7 +253,7 @@ final class ShellRunnerTests: XCTestCase {
         let args = decodeNullSeparatedArguments(from: argsData)
         XCTAssertEqual(args[0], "-p")
         XCTAssertTrue(args[1].hasPrefix("Fix grammar"))
-        XCTAssertTrue(args[1].hasSuffix("\n\nthis are wrong"))
+        XCTAssertTrue(args[1].hasSuffix("\n\n<selected>\nthis are wrong\n</selected>"))
         XCTAssertEqual(args[2], "--setting-sources")
         XCTAssertEqual(args[3], "user")
         XCTAssertEqual(args[4], "--tools")
@@ -183,7 +298,7 @@ final class ShellRunnerTests: XCTestCase {
         XCTAssertEqual(args[6], "--model")
         XCTAssertEqual(args[7], "gpt-5-codex")
         XCTAssertTrue(args[8].hasPrefix("p"))
-        XCTAssertTrue(args[8].hasSuffix("\n\nx"))
+        XCTAssertTrue(args[8].hasSuffix("\n\n<selected>\nx\n</selected>"))
     }
 
     func testCorrectTextPassesExpectedArgumentsForGemini() throws {
@@ -208,7 +323,7 @@ final class ShellRunnerTests: XCTestCase {
         let args = decodeNullSeparatedArguments(from: argsData)
         XCTAssertEqual(args[0], "--prompt")
         XCTAssertTrue(args[1].hasPrefix("p"))
-        XCTAssertTrue(args[1].hasSuffix("\n\nx"))
+        XCTAssertTrue(args[1].hasSuffix("\n\n<selected>\nx\n</selected>"))
         XCTAssertEqual(args[2], "--output-format")
         XCTAssertEqual(args[3], "text")
         XCTAssertEqual(args[4], "--model")
@@ -872,6 +987,119 @@ final class ShellRunnerTests: XCTestCase {
         XCTAssertEqual(result, "This is a sentence with an em dash.")
     }
 
+    func testDelimitedCorrectionRequiresBothMarkersInOrder() {
+        XCTAssertNil(ShellRunner.delimitedCorrection(in: "plain text"))
+        XCTAssertNil(ShellRunner.delimitedCorrection(in: "<<<TEXT>>> missing end"))
+        XCTAssertNil(ShellRunner.delimitedCorrection(in: "<<<END>>> before <<<TEXT>>>"))
+        XCTAssertEqual(
+            ShellRunner.delimitedCorrection(in: "pre\n<<<TEXT>>>\nHi\n\nThere\n<<<END>>>\npost"),
+            "\nHi\n\nThere\n"
+        )
+    }
+
+    func testCorrectionOnlyDropsWrappersAndKeepsTheResult() {
+        XCTAssertEqual(ShellRunner.correctionOnly(in: "任意前言\n<<<TEXT>>>\nHi\n<<<END>>>\n任意后记"), "Hi")
+        XCTAssertEqual(ShellRunner.correctionOnly(in: "ignore\n<<<TEXT>>>\nHi there"), "Hi there")
+        XCTAssertEqual(ShellRunner.correctionOnly(in: "Hi there\n<<<END>>>\npost"), "")
+        XCTAssertEqual(
+            ShellRunner.correctionOnly(in: "Target language: English. Translate the user text into English. If it is already English, correct the grammar. Do not return the original language.\nIf anyone needs colleagues online, share the name."),
+            "If anyone needs colleagues online, share the name."
+        )
+        XCTAssertEqual(
+            ShellRunner.correctionOnly(in: "get a green mark for this sentence /no_think"),
+            "get a green mark for this sentence"
+        )
+        XCTAssertEqual(
+            ShellRunner.correctionOnly(in: "Put that short line in /no_think"),
+            "Put that short line in"
+        )
+        XCTAssertEqual(
+            ShellRunner.correctionOnly(in: "<think>should translate</think>get a green mark for this sentence /no_think"),
+            "get a green mark for this sentence"
+        )
+        XCTAssertEqual(ShellRunner.correctionOnly(in: "<think>a</think><think>b</think>Hi"), "Hi")
+        XCTAssertEqual(ShellRunner.correctionOnly(in: "Hi<think>secret"), "Hi")
+        XCTAssertEqual(ShellRunner.correctionOnly(in: "Hi</think>"), "Hi")
+        XCTAssertEqual(ShellRunner.correctionOnly(in: "fixed /think"), "fixed")
+        XCTAssertEqual(ShellRunner.correctionOnly(in: "see path/think"), "see path/think")
+        XCTAssertEqual(ShellRunner.correctionOnly(in: "keep /no_think please"), "keep /no_think please")
+        XCTAssertEqual(
+            ShellRunner.correctionOnly(in: "notes\n<<<TEXT>>>\nHi /no_think\n<<<END>>>\nbye"),
+            "Hi"
+        )
+        XCTAssertEqual(ShellRunner.correctionOnly(in: "Hello\n\nThere"), "Hello\n\nThere")
+        XCTAssertEqual(ShellRunner.correctionOnly(in: ""), "")
+        XCTAssertEqual(ShellRunner.correctionOnly(in: "\n\n"), "")
+        XCTAssertEqual(ShellRunner.correctionOnly(in: "Correction:"), "Correction:")
+        XCTAssertEqual(ShellRunner.correctionOnly(in: "**Corrected text:**\n\nHello"), "Hello")
+        XCTAssertEqual(ShellRunner.correctionOnly(in: "```text\nHello\n```"), "Hello")
+        XCTAssertEqual(ShellRunner.correctionOnly(in: "改正如下：你好"), "你好")
+        XCTAssertEqual(
+            ShellRunner.correctionOnly(in: "Hello\n\nNote: keep this paragraph"),
+            "Hello\n\nNote: keep this paragraph"
+        )
+        XCTAssertEqual(
+            ShellRunner.correctionOnly(in: "I corrected text yesterday.\nLeave this."),
+            "I corrected text yesterday.\nLeave this."
+        )
+        XCTAssertEqual(
+            ShellRunner.correctionOnly(in: "以下是修正后的会议纪要。\n第二段。"),
+            "以下是修正后的会议纪要。\n第二段。"
+        )
+        let echoed = """
+        If the input is already in English, correct it and keep it in English. If the input is not in English, translate it into English. Do not leave any sentence in another language.
+
+        Output language: English.
+        This overrides any instruction to preserve the original language.
+
+        <<<TEXT>>>
+        If the input is already in English, correct it and keep it in English. If the input is not in English, translate it into English. Do not leave any sentence in another language.
+        """
+        XCTAssertEqual(ShellRunner.correctionOnly(in: echoed), "")
+        XCTAssertEqual(
+            ShellRunner.correctionOnly(in: "<<<TEXT>>>\nOutput language: English.\nHello there.\n<<<END>>>"),
+            "Hello there."
+        )
+        XCTAssertFalse(ShellRunner.isContractEcho("Hello there."))
+        XCTAssertFalse(ShellRunner.isLeadingLabel("   "))
+        XCTAssertFalse(ShellRunner.isLeadingLabel(String(repeating: "x", count: 70)))
+        XCTAssertFalse(ShellRunner.isLeadingLabel("以下是翻译结果："))
+        XCTAssertTrue(ShellRunner.isLeadingLabel("# Translation:"))
+        XCTAssertEqual(ShellRunner.stripInlinePrefix(from: "correction:"), "correction:")
+        XCTAssertEqual(ShellRunner.stripInlinePrefix(from: "翻译如下：完成"), "完成")
+    }
+
+    func testLanguageContractStripsFencedOutputAndCanBeDisabled() throws {
+        let testEnv = try makeRunnerEnvironment()
+        var config = AppConfig.default.withProvider(.claude, executablePath: "/usr/bin/true", model: "haiku")
+        config.language = "en"
+        try testEnv.manager.saveConfig(config)
+        let mock = MockPersistentCLISession()
+        mock.mockIsReady = true
+        mock.mockSendResult = PersistentCLISession.StreamResult(
+            text: "notes\n<<<TEXT>>>\nHello \u{2014} there\n\nNext\n<<<END>>>\nbye"
+        )
+        testEnv.runner.setPersistentSessionForTesting(mock)
+
+        XCTAssertEqual(
+            try testEnv.runner.correctText(systemPrompt: "Fix", selectedText: "原文"),
+            "Hello there\n\nNext"
+        )
+        XCTAssertTrue(mock.lastPrompt?.contains("Translate the user text into English") == true)
+        XCTAssertTrue(mock.lastPrompt?.hasSuffix("\n<selected>\n原文\n</selected>") == true)
+
+        mock.mockSendResult = PersistentCLISession.StreamResult(text: "<<<TEXT>>>\nkeep this JSON\n<<<END>>>")
+        let coach = try testEnv.runner.correctText(
+            systemPrompt: "Return JSON",
+            selectedText: "samples",
+            includeLanguageContract: false
+        )
+        XCTAssertEqual(coach, "<<<TEXT>>>\nkeep this JSON\n<<<END>>>")
+        XCTAssertFalse(mock.lastPrompt?.contains("<<<TEXT>>>") == true)
+        XCTAssertFalse(mock.lastPrompt?.contains("translate") == true)
+        XCTAssertTrue(mock.lastPrompt?.hasSuffix("\n\nsamples") == true)
+    }
+
     func testTrimPreservingInternalNewlinesStripsMultipleEmDashes() {
         let input = "First \u{2014} second \u{2014} third"
         let result = ShellRunner.trimPreservingInternalNewlines(input)
@@ -1069,7 +1297,9 @@ final class ShellRunnerTests: XCTestCase {
         let argsData = try Data(contentsOf: argsLog)
         let args = decodeNullSeparatedArguments(from: argsData)
         // The prompt should contain language instruction
-        XCTAssertTrue(args[1].contains("French"), "Prompt should include language instruction")
+        XCTAssertTrue(args[1].contains("Translate the user text into French"), "Prompt should require French output")
+        XCTAssertTrue(args[1].contains("<<<TEXT>>>"), "Prompt should require the fenced output format")
+        XCTAssertTrue(args[1].hasSuffix("\n\n<selected>\ntest\n</selected>"))
     }
 
     func testCorrectTextStreamingLargeOutput() throws {
@@ -1447,7 +1677,9 @@ final class ShellRunnerTests: XCTestCase {
 
         let result = try testEnv.runner.correctText(systemPrompt: "Fix", selectedText: "test")
         XCTAssertEqual(result, "resultado")
-        XCTAssertTrue(mock.lastPrompt?.contains("Spanish") == true || mock.lastPrompt?.contains("Respond in") == true)
+        XCTAssertTrue(mock.lastPrompt?.contains("Translate the user text into spanish") == true)
+        XCTAssertTrue(mock.lastPrompt?.contains("<<<TEXT>>>") == true)
+        XCTAssertTrue(mock.lastPrompt?.hasSuffix("\n\n<selected>\ntest\n</selected>") == true)
     }
 
     func testSpawnPersistentSessionViaFactorySuccess() throws {
@@ -1550,6 +1782,7 @@ private extension AppConfig {
         var claudePath = claudePath
         var codexPath = codexPath
         var geminiPath = geminiPath
+        var grokPath = grokPath
 
         switch provider {
         case .claude:
@@ -1558,7 +1791,9 @@ private extension AppConfig {
             codexPath = executablePath
         case .gemini:
             geminiPath = executablePath
-        case .ollama:
+        case .grok:
+            grokPath = executablePath
+        case .ollama, .magpie:
             break
         }
 
@@ -1572,7 +1807,8 @@ private extension AppConfig {
             hotkeyKeyCode: hotkeyKeyCode,
             hotkeyModifiers: hotkeyModifiers,
             launchAtLogin: launchAtLogin,
-            historyLimit: historyLimit
+            historyLimit: historyLimit,
+            grokPath: grokPath
         )
     }
 

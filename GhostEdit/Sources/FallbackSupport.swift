@@ -1,24 +1,13 @@
 import Foundation
 
 enum FallbackSupport {
-    /// Returns the next model to try for a given provider after the current
-    /// model fails. Returns `nil` when no fallback is available.
-    static func nextFallbackModel(
-        currentModel: String,
-        provider: CLIProvider
-    ) -> String? {
-        let models = provider.availableModels
-        guard let idx = models.firstIndex(of: currentModel) else {
-            // Unknown model - try the default as fallback.
-            let defaultModel = provider.defaultModel
-            return currentModel == defaultModel ? nil : defaultModel
-        }
-        // Try the next model in the list (wrapping is intentionally NOT done -
-        // only one fallback attempt per correction).
+    /// Returns the next cached model after the current one. Returns nil when the
+    /// current model is missing or last. The list comes from the refreshed catalog,
+    /// never from a compiled-in model list.
+    static func nextFallbackModel(currentModel: String, models: [String]) -> String? {
+        guard let idx = models.firstIndex(of: currentModel) else { return nil }
         let nextIdx = idx + 1
-        guard nextIdx < models.count else {
-            return nil
-        }
+        guard nextIdx < models.count else { return nil }
         return models[nextIdx]
     }
 

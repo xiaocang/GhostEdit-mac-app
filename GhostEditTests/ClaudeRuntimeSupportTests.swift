@@ -211,6 +211,31 @@ final class ClaudeRuntimeSupportTests: XCTestCase {
         ])
     }
 
+    func testCLIArgumentsForGrokLimitTurnsAndTools() throws {
+        let withModel = try ClaudeRuntimeSupport.cliArguments(
+            provider: .grok, prompt: "hello", model: " grok-4.7 "
+        )
+        let withoutModel = try ClaudeRuntimeSupport.cliArguments(
+            provider: .grok, prompt: "hello", model: " "
+        )
+        XCTAssertEqual(withModel, [
+            "--no-auto-update", "--no-alt-screen", "-p", "hello",
+            "--output-format", "plain", "--max-turns", "1",
+            "--no-plan", "--no-subagents", "--disable-web-search",
+            "-m", "grok-4.7"
+        ])
+        XCTAssertFalse(withoutModel.contains("-m"))
+    }
+
+    func testNotAuthenticatedIsAnAuthFailure() {
+        let error = ClaudeRuntimeSupport.classifyProcessFailure(
+            provider: .grok, exitCode: 1, stdout: "You are not authenticated.", stderr: ""
+        )
+        guard case .authenticationRequired(provider: .grok) = error else {
+            return XCTFail("Grok auth failures must be classified, got \(error)")
+        }
+    }
+
     func testClaudeWrapperFunctionsMapToGenericHelpers() throws {
         let searchPaths = ClaudeRuntimeSupport.claudeSearchPaths(
             homeDirectoryPath: "/Users/example",
@@ -232,11 +257,13 @@ final class ClaudeRuntimeSupportTests: XCTestCase {
     }
 
     func testHTTPProviderCannotBeLaunchedAsACloudCLI() {
-        XCTAssertThrowsError(try ClaudeRuntimeSupport.cliArguments(
-            provider: .ollama, prompt: "Private text", model: "qwen3:1.7b"
-        )) { error in
-            guard case ClaudeRuntimeSupport.InvocationError.httpProvider = error else {
-                return XCTFail("HTTP corrections must reject accidental CLI dispatch, got \(error)")
+        for provider in [CLIProvider.ollama, .magpie] {
+            XCTAssertThrowsError(try ClaudeRuntimeSupport.cliArguments(
+                provider: provider, prompt: "Private text", model: "editor"
+            )) { error in
+                guard case ClaudeRuntimeSupport.InvocationError.httpProvider = error else {
+                    return XCTFail("HTTP corrections must reject accidental CLI dispatch, got \(error)")
+                }
             }
         }
     }

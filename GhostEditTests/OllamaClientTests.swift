@@ -201,7 +201,57 @@ final class OllamaClientTests: XCTestCase {
             stub.respond(chunks: [Data("{\"models\":[{\"name\":\"qwen3:1.7b\"},{\"name\":\"qwen3:0.6b\"}]}".utf8)])
         }
         XCTAssertEqual(try backend.listModels(), ["qwen3:1.7b", "qwen3:0.6b"])
+        let namedByModel = client { stub in
+            stub.respond(chunks: [Data("{\"models\":[{\"model\":\"llama3:latest\"},{\"name\":\"  \",\"model\":\"qwen3:1.7b\"}]}".utf8)])
+        }
+        XCTAssertEqual(try namedByModel.listModels(), ["llama3:latest", "qwen3:1.7b"])
         let invalid = client { $0.respond(chunks: [Data("{}".utf8)]) }
         XCTAssertThrowsError(try invalid.listModels())
+    }
+
+    func testListsCloudModelsBesideInstalledModels() throws {
+        let (localURL, configuration) = OllamaURLProtocol.stub { stub in
+            XCTAssertEqual(stub.request.url?.path, "/api/tags")
+            stub.respond(chunks: [Data(#"{"models":[{"name":"qwen3:1.7b"},{"name":"gemma4:31b-cloud"}]}"#.utf8)])
+        }
+        let (cloudURL, _) = OllamaURLProtocol.stub { stub in
+            XCTAssertTrue(stub.request.url?.host?.hasSuffix(".test") == true)
+            stub.respond(chunks: [Data(#"{"models":[{"name":"gemma4:31b"},{"name":"kimi-k3"},{"name":"gpt-oss:120b"},{"name":"gemma4:31b-cloud"}]}"#.utf8)])
+        }
+        let backend = OllamaClient(
+            baseURL: localURL,
+            timeoutSeconds: 2,
+            sessionConfiguration: configuration,
+            cloudCatalogURL: cloudURL
+        )
+        XCTAssertEqual(
+            try backend.listModels(),
+            ["qwen3:1.7b", "gemma4:31b-cloud", "kimi-k3:cloud", "gpt-oss:120b-cloud"]
+        )
+    }
+
+    func testCloudCatalogFailureKeepsInstalledModels() throws {
+        let (localURL, configuration) = OllamaURLProtocol.stub { stub in
+            stub.respond(chunks: [Data(#"{"models":[{"name":"qwen3:0.6b"}]}"#.utf8)])
+        }
+        let backend = OllamaClient(
+            baseURL: localURL,
+            timeoutSeconds: 2,
+            sessionConfiguration: configuration,
+            cloudCatalogURL: "http://missing.cloud.test"
+        )
+        XCTAssertEqual(try backend.listModels(), ["qwen3:0.6b"])
+    }
+
+    func testCloudModelNameUsesTagSuffixWhenTheCatalogNameIsTagged() {
+        XCTAssertEqual(OllamaClient.cloudModelName(for: "kimi-k3"), "kimi-k3:cloud")
+        XCTAssertEqual(OllamaClient.cloudModelName(for: " gpt-oss:120b "), "gpt-oss:120b-cloud")
+        XCTAssertEqual(OllamaClient.cloudModelName(for: "gemma4:31b-cloud"), "gemma4:31b-cloud")
+        XCTAssertEqual(OllamaClient.cloudModelName(for: "already:cloud"), "already:cloud")
+        XCTAssertEqual(OllamaClient.cloudModelName(for: "   "), "")
+        XCTAssertEqual(
+            OllamaClient.mergingCloudModels(local: ["local:latest"], catalog: ["", "local:latest", "kimi-k3"]),
+            ["local:latest", "local:latest-cloud", "kimi-k3:cloud"]
+        )
     }
 }

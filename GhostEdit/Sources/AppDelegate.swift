@@ -15,18 +15,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private lazy var shellRunner = ShellRunner(configManager: configManager)
     private var settingsWindowController: SettingsWindowController?
     private var historyWindowController: HistoryWindowController?
-    private var hudController: HUDOverlayController?
     private var developerConsoleController: DeveloperConsoleController?
-    private var diffPreviewController: DiffPreviewController?
-    private var streamingPreviewController: StreamingPreviewController?
     private var liveFeedbackController: LiveFeedbackController?
-    private lazy var localModelRunner: LocalModelRunner? = LocalModelRunner()
+    private let correctionFloater = CorrectionFloaterController()
+    private var pendingFloaterAnchor: CGRect?
 
     private var statusMenu: NSMenu?
     private var statusMenuItem: NSMenuItem?
     private var statusDetailMenuItem: NSMenuItem?
     private var runNowMenuItem: NSMenuItem?
-    private var undoMenuItem: NSMenuItem?
     private var historyMenuItem: NSMenuItem?
     private var writingCoachMenuItem: NSMenuItem?
     private var developerModeMenuItem: NSMenuItem?
@@ -35,16 +32,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private var checkUpdatesMenuItem: NSMenuItem?
     private var liveFeedbackMenuItem: NSMenuItem?
 
-    private var pendingDiffOriginalText: String?
-    private var pendingPreviewSource: PreviewSource?
-    private struct LineContext {
-        let fullText: String
-        let lineRange: NSRange
-        let lineText: String
-        let pid: pid_t
-    }
-    private var pendingLineContext: LineContext?
     private var isProcessing = false
+    private var correctionGeneration = 0
     private var isShowingAccessibilityAlert = false
     private var didShowAccessibilityGuidance = false
     private var clipboardSnapshot: ClipboardManager.Snapshot?
@@ -76,17 +65,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         setupEditMenu()
         configureStatusItem()
 
+        correctionFloater.onCopy = { [weak self] text in
+            self?.copyFloaterResult(text)
+        }
+        correctionFloater.onUserDismiss = { [weak self] in
+            self?.cancelInFlightCorrection()
+        }
         do {
             try configManager.bootstrapIfNeeded()
-            // Copy bundled inference script to scripts directory (requires app bundle)
-            if let bundledScript = Bundle.main.path(forResource: "ghostedit_infer", ofType: "py") {
-                let destScript = configManager.scriptsDirectoryURL.appendingPathComponent("ghostedit_infer.py")
-                try? FileManager.default.removeItem(at: destScript)
-                try? FileManager.default.copyItem(
-                    at: URL(fileURLWithPath: bundledScript),
-                    to: destScript
-                )
-            }
             try historyStore.bootstrapIfNeeded()
         } catch {
             showFatalAlert(
@@ -110,7 +96,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkeyManager.unregister()
         stopLiveFeedback()
         shellRunner.killPersistentSession()
-        localModelRunner?.shutdown()
         stopProcessingIndicator()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
@@ -160,30 +145,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(sectionHeader("CORRECTION"))
 
         let runNow = NSMenuItem(
-            title: "Fix Selected Text",
+            title: "Correct Selection",
             action: #selector(runNowAction),
             keyEquivalent: ""
         )
         runNow.target = self
         runNow.image = sfSymbol("pencil.and.outline", size: 15)
-        // Show current hotkey combo as tooltip hint
         let hotkeyDisplay = HotkeySupport.displayString(
             keyCode: config.hotkeyKeyCode,
             modifiers: config.hotkeyModifiers
         )
-        runNow.toolTip = "Hotkey: \(hotkeyDisplay)"
+        runNow.toolTip = "Shows a nearby diff. Does not replace the text. Hotkey: \(hotkeyDisplay)"
         menu.addItem(runNow)
         runNowMenuItem = runNow
-
-        let undo = NSMenuItem(
-            title: "Undo Last Correction",
-            action: #selector(undoLastCorrectionAction),
-            keyEquivalent: ""
-        )
-        undo.target = self
-        undo.image = sfSymbol("arrow.uturn.backward", size: 15)
-        menu.addItem(undo)
-        undoMenuItem = undo
 
         menu.addItem(.separator())
 
@@ -432,9 +406,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startLiveFeedback() {
         guard liveFeedbackController == nil else { return }
-        liveFeedbackController = LiveFeedbackController(
-            configManager: configManager, localModelRunner: localModelRunner
-        )
+        liveFeedbackController = LiveFeedbackController(configManager: configManager)
         liveFeedbackController?.onAXWriteBlocked = { [weak self] original, fixed in
             self?.writeBackViaClipboard(fixedText: fixed, original: original)
         }
@@ -469,21 +441,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func registerHotkey() {
         let config = configManager.loadConfig()
-
-        hotkeyManager.registerDual(
-            localKeyCode: config.hotkeyKeyCode,
-            localModifiers: config.hotkeyModifiers,
-            cloudKeyCode: config.cloudHotkeyKeyCode,
-            cloudModifiers: config.cloudHotkeyModifiers
-        ) { [weak self] variant in
+        hotkeyManager.register(
+            keyCode: config.hotkeyKeyCode,
+            modifiers: config.hotkeyModifiers
+        ) { [weak self] in
             DispatchQueue.main.async {
-                if variant == 0 {
-                    // Local hotkey (e.g. Cmd+E) → local fix-all
-                    self?.handleLocalFixHotkey()
-                } else {
-                    // Cloud hotkey (e.g. Cmd+Shift+E) → LLM correction
-                    self?.handleHotkeyTrigger()
-                }
+                self?.handleHotkeyTrigger()
             }
         }
     }
@@ -491,100 +454,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func runNowAction() {
         statusMenu?.cancelTracking()
         handleHotkeyTrigger()
-    }
-
-    @objc private func undoLastCorrectionAction() {
-        statusMenu?.cancelTracking()
-
-        guard !isProcessing else {
-            playErrorSound()
-            setStatus("Already processing")
-            return
-        }
-
-        guard ensureAccessibilityPermission(promptSystemDialog: false, showGuidanceAlert: true) else {
-            playErrorSound()
-            setStatus("Accessibility permission required")
-            return
-        }
-
-        guard let entry = historyStore.lastSuccessfulEntry() else {
-            playErrorSound()
-            setStatus("No correction to undo")
-            return
-        }
-
-        guard let targetApp = resolveTargetApplication() else {
-            playErrorSound()
-            setStatus("Could not determine target app; focus text app and retry")
-            return
-        }
-
-        devLog(.textCapture, "Undo: restoring original text (\(entry.originalText.count) chars)")
-
-        isProcessing = true
-        targetAppAtTrigger = targetApp
-        showHUD(state: .working)
-
-        // Local fixes replace the entire field content - use AXValueAttribute directly
-        if entry.provider == "Local" {
-            let appElement = AXUIElementCreateApplication(targetApp.processIdentifier)
-            var focusedValue: AnyObject?
-            if AXUIElementCopyAttributeValue(
-                appElement, kAXFocusedUIElementAttribute as CFString, &focusedValue
-            ) == .success, let focused = focusedValue {
-                let element = focused as! AXUIElement
-                let result = AXUIElementSetAttributeValue(
-                    element, kAXValueAttribute as CFString, entry.originalText as CFTypeRef
-                )
-                if result == .success {
-                    devLog(.pasteBack, "Undo: local fix AX value replacement succeeded")
-                    let time = timeFormatter.string(from: Date())
-                    setStatus("Undo succeeded at \(time)")
-                    updateHUD(state: .success)
-                    finishProcessing()
-                    return
-                }
-            }
-            // Fall through to existing clipboard fallback if AX fails
-        }
-
-        // Try AX replacement first.
-        if AccessibilityTextSupport.replaceSelectedText(
-            appPID: targetApp.processIdentifier,
-            with: entry.originalText
-        ) {
-            devLog(.pasteBack, "Undo: AX replacement succeeded")
-            let time = timeFormatter.string(from: Date())
-            setStatus("Undo succeeded at \(time)")
-            updateHUD(state: .success)
-            finishProcessing()
-            return
-        }
-
-        // Fall back to clipboard paste.
-        devLog(.pasteBack, "Undo: falling back to clipboard paste")
-        clipboardSnapshot = clipboardManager.snapshot()
-        clipboardManager.writePlainText(entry.originalText)
-        targetApp.activate(options: [.activateAllWindows])
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            guard let self else { return }
-            let pasted = self.clipboardManager.simulatePasteShortcut(using: .annotatedSession)
-                || self.clipboardManager.simulatePasteShortcut(using: .hidSystem)
-
-            if pasted {
-                let time = self.timeFormatter.string(from: Date())
-                self.setStatus("Undo succeeded at \(time)")
-                self.updateHUD(state: .success)
-            } else {
-                self.playErrorSound()
-                self.setStatus("Undo paste failed")
-                self.dismissHUD()
-            }
-            self.restoreClipboardSnapshot(after: 0.20)
-            self.finishProcessing()
-        }
     }
 
     @objc private func openPromptFileAction() {
@@ -715,292 +584,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.terminate(nil)
     }
 
-    // MARK: - Local Fix Pipeline (cmd+E)
-
-    private func handleLocalFixHotkey() {
-        pendingClipboardRestore?.cancel()
-        pendingClipboardRestore = nil
-
-        guard ensureAccessibilityPermission(promptSystemDialog: false, showGuidanceAlert: true) else {
-            playErrorSound()
-            return
-        }
-
-        // Trigger a one-shot local fix on the focused text field
-        guard let targetApp = NSWorkspace.shared.frontmostApplication else {
-            playErrorSound()
-            return
-        }
-
-        let pid = targetApp.processIdentifier
-        let appElement = AXUIElementCreateApplication(pid)
-        var focusedValue: AnyObject?
-        let focusResult = AXUIElementCopyAttributeValue(
-            appElement, kAXFocusedUIElementAttribute as CFString, &focusedValue
-        )
-        guard focusResult == .success, let focused = focusedValue else {
-            // AX focus failed — try full clipboard round-trip
-            handleLocalFixViaClipboard()
-            return
-        }
-        let element = focused as! AXUIElement
-        var textValue: AnyObject?
-        AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &textValue)
-        guard let currentText = textValue as? String, !currentText.isEmpty else {
-            // AX read failed — try full clipboard round-trip
-            handleLocalFixViaClipboard()
-            return
-        }
-
-        // Save cursor position and selection length before applying fixes
-        var cursorLocation = (currentText as NSString).length
-        var selectionLength = 0
-        var rangeValue: AnyObject?
-        if AXUIElementCopyAttributeValue(
-            element, kAXSelectedTextRangeAttribute as CFString, &rangeValue
-        ) == .success, let axValue = rangeValue {
-            var savedRange = CFRange(location: 0, length: 0)
-            if AXValueGetValue(axValue as! AXValue, .cfRange, &savedRange) {
-                cursorLocation = savedRange.location
-                selectionLength = savedRange.length
-            }
-        }
-
-        // If user has text selected, fix only the selection.
-        // If no selection (cursor only), fix the line at cursor.
-        // Skip for text containing U+FFFC (Slack inline emojis) - bulk text write
-        // destroys object replacement characters in Electron apps.
-        let lineExtraction: (lineText: String, lineRange: NSRange)?
-        if selectionLength > 0 {
-            let selRange = NSRange(location: cursorLocation, length: selectionLength)
-            let nsCurrentText = currentText as NSString
-            if selRange.location + selRange.length <= nsCurrentText.length {
-                var selectedText = nsCurrentText.substring(with: selRange)
-                if selectedText.hasSuffix("\n") {
-                    selectedText = String(selectedText.dropLast())
-                }
-                if selectedText.trimmingCharacters(in: .whitespaces).isEmpty {
-                    lineExtraction = nil
-                } else {
-                    lineExtraction = (selectedText, selRange)
-                }
-            } else {
-                lineExtraction = nil
-            }
-        } else if currentText.contains(TokenPreservationSupport.objectReplacementCharacter) {
-            lineExtraction = nil
-        } else {
-            lineExtraction = extractLineAtCursor(text: currentText, cursorLocation: cursorLocation)
-        }
-        let textToFix = lineExtraction?.lineText ?? currentText
-
-        // Try local Hugging Face model if configured, otherwise use Harper+NSSpellChecker
-        if !configManager.loadConfig().localModelRepoID.isEmpty,
-           let runner = localModelRunner {
-            let config = configManager.loadConfig()
-            let modelPath = LocalModelSupport.modelDirectoryURL(
-                baseDirectoryURL: configManager.baseDirectoryURL,
-                repoID: config.localModelRepoID
-            ).path
-            let pythonPath = config.localModelPythonPath.isEmpty
-                ? PythonEnvironmentSupport.detectPythonPath(homeDirectoryPath: FileManager.default.homeDirectoryForCurrentUser.path)
-                : config.localModelPythonPath
-            let promptTemplate = LocalModelSupport.resolvedPromptTemplate(for: config.localModelRepoID, config: config)
-
-            // Step 1: Apply Harper + Dictionary fixes first (instant spelling/punctuation)
-            let spellFixed = applyRuleBasedTextFixes(textToFix)
-
-            showHUD(state: .working)
-            Task.detached { [weak self] in
-                do {
-                    let protection = TokenPreservationSupport.protectTokens(in: spellFixed)
-                    let textForModel = protection.hasProtectedTokens ? protection.protectedText : spellFixed
-                    let rawCorrected = try runner.correctText(
-                        textForModel,
-                        modelPath: modelPath,
-                        pythonPath: pythonPath,
-                        timeoutSeconds: 120,
-                        promptTemplate: promptTemplate
-                    )
-                    let corrected: String
-                    if protection.hasProtectedTokens {
-                        corrected = TokenPreservationSupport.bestEffortRestore(in: rawCorrected, tokens: protection.tokens)
-                    } else {
-                        corrected = rawCorrected
-                    }
-                    let trimmed = corrected.trimmingCharacters(in: .whitespacesAndNewlines)
-
-                    await MainActor.run {
-                        guard let self else { return }
-
-                        // Step 2: Determine final text based on what changed
-                        let finalText: String
-                        let toolLabel: String
-                        if trimmed.isEmpty || trimmed == spellFixed {
-                            // Model returned unchanged - use spell-fixed text if it differs
-                            if spellFixed == textToFix {
-                                // Neither Harper nor Model changed anything
-                                self.showHUD(state: .success)
-                                targetApp.activate(options: [])
-                                return
-                            }
-                            finalText = spellFixed
-                            toolLabel = "Harper + Dictionary"
-                        } else {
-                            let polished = self.applyRuleBasedTextFixes(trimmed)
-                            finalText = polished
-                            toolLabel = spellFixed != textToFix
-                                ? "Harper + Local Model" : "Local Model"
-                        }
-
-                        // Write back the corrected line (or full text if no line extraction)
-                        if let extraction = lineExtraction {
-                            _ = self.writeBackCorrectedLine(
-                                correctedLine: finalText, lineRange: extraction.lineRange,
-                                fullText: currentText, pid: pid
-                            )
-                        } else {
-                            AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, finalText as CFTypeRef)
-                            self.restoreCursorPosition(
-                                pid: pid, cursorLocation: cursorLocation,
-                                newTextLength: (finalText as NSString).length, cursorDelta: 0
-                            )
-                        }
-                        // Tell LiveFeedback to auto-apply any remaining grammar/punctuation
-                        // fixes it detects on its next scan (e.g. comma after @mentions)
-                        self.liveFeedbackController?.requestAutoApply()
-                        self.recordLocalFixHistoryEntry(original: textToFix, fixed: finalText)
-                        self.showHUDWithDiff(original: textToFix, fixed: finalText, toolsUsed: toolLabel)
-                        targetApp.activate(options: [])
-                    }
-                } catch {
-                    await MainActor.run {
-                        guard let self else { return }
-                        self.devLog(.cliExecution, "Local model error: \(error.localizedDescription) - falling back to Harper + Dictionary")
-                        // On model error, use spell-fixed text if it differs from original
-                        if spellFixed != textToFix {
-                            if let extraction = lineExtraction {
-                                _ = self.writeBackCorrectedLine(
-                                    correctedLine: spellFixed, lineRange: extraction.lineRange,
-                                    fullText: currentText, pid: pid
-                                )
-                            } else {
-                                AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, spellFixed as CFTypeRef)
-                                self.restoreCursorPosition(
-                                    pid: pid, cursorLocation: cursorLocation,
-                                    newTextLength: (spellFixed as NSString).length, cursorDelta: 0
-                                )
-                            }
-                            self.recordLocalFixHistoryEntry(original: textToFix, fixed: spellFixed)
-                            self.showHUDWithDiff(original: textToFix, fixed: spellFixed, toolsUsed: "Harper + Dictionary")
-                        } else {
-                            self.updateHUD(state: .error(error.localizedDescription))
-                        }
-                        targetApp.activate(options: [])
-                    }
-                }
-            }
-        } else {
-            if let fixedText = applyRuleBasedFixes(
-                text: textToFix, pid: pid, element: element, cursorLocation: cursorLocation,
-                lineRange: lineExtraction?.lineRange, fullText: lineExtraction != nil ? currentText : nil
-            ) {
-                liveFeedbackController?.requestAutoApply()
-                recordLocalFixHistoryEntry(original: textToFix, fixed: fixedText)
-                showHUDWithDiff(original: textToFix, fixed: fixedText, toolsUsed: "Harper + Dictionary")
-            }
-            targetApp.activate(options: [])
-        }
-    }
-
     /// Extract the line containing the cursor position.
     /// Returns the line text (trimmed of trailing newline for correction) and its range in the full text.
     private func extractLineAtCursor(text: String, cursorLocation: Int) -> (lineText: String, lineRange: NSRange)? {
         LocalFixSupport.extractLineAtCursor(text: text, cursorLocation: cursorLocation)
-    }
-
-    /// Write back a corrected line into the full text field, placing cursor at end of fixed line.
-    /// Returns true if the write succeeded via AX.
-    private func writeBackCorrectedLine(
-        correctedLine: String, lineRange: NSRange, fullText: String, pid: pid_t
-    ) -> Bool {
-        let nsFullText = fullText as NSString
-        let originalLine = nsFullText.substring(with: lineRange)
-        let reconstructed: String
-        if originalLine.hasSuffix("\n") {
-            reconstructed = nsFullText.replacingCharacters(in: lineRange, with: correctedLine + "\n")
-        } else {
-            reconstructed = nsFullText.replacingCharacters(in: lineRange, with: correctedLine)
-        }
-
-        // Try writing via kAXValueAttribute on a fresh focused element
-        let appElement = AXUIElementCreateApplication(pid)
-        var focusedValue: AnyObject?
-        let wrote: Bool
-        if AXUIElementCopyAttributeValue(
-            appElement, kAXFocusedUIElementAttribute as CFString, &focusedValue
-        ) == .success, let focused = focusedValue {
-            let el = focused as! AXUIElement
-            wrote = AXUIElementSetAttributeValue(
-                el, kAXValueAttribute as CFString, reconstructed as CFTypeRef
-            ) == .success
-        } else {
-            wrote = false
-        }
-
-        if !wrote {
-            // Fallback: replaceTextAtRange
-            let cfRange = CFRange(location: lineRange.location, length: lineRange.length)
-            let fallback = AccessibilityTextSupport.replaceTextAtRange(
-                appPID: pid, range: cfRange, with: correctedLine
-            )
-            guard fallback else { return false }
-        }
-
-        // Place cursor at end of fixed line
-        let cursorPos = lineRange.location + (correctedLine as NSString).length
-        _ = AccessibilityTextSupport.setCursorPosition(appPID: pid, position: cursorPos)
-        return true
-    }
-
-    /// Position cursor at the end of text in the focused element (for Electron apps after paste).
-    private func positionCursorAtEnd(pid: pid_t) {
-        let appElement = AXUIElementCreateApplication(pid)
-        var focusedValue: AnyObject?
-        guard AXUIElementCopyAttributeValue(
-            appElement, kAXFocusedUIElementAttribute as CFString, &focusedValue
-        ) == .success, let focused = focusedValue else { return }
-        let element = focused as! AXUIElement
-        var textValue: AnyObject?
-        guard AXUIElementCopyAttributeValue(
-            element, kAXValueAttribute as CFString, &textValue
-        ) == .success, let text = textValue as? String else { return }
-        let textLength = (text as NSString).length
-        var endRange = CFRange(location: textLength, length: 0)
-        if let rangeValue = AXValueCreate(.cfRange, &endRange) {
-            AXUIElementSetAttributeValue(
-                element, kAXSelectedTextRangeAttribute as CFString, rangeValue
-            )
-        }
-    }
-
-    /// Re-query the focused element and restore cursor position.
-    /// Some apps invalidate the AXUIElement after text changes, so we must re-query.
-    private func restoreCursorPosition(pid: pid_t, cursorLocation: Int, newTextLength: Int, cursorDelta: Int) {
-        let appElement = AXUIElementCreateApplication(pid)
-        var focusedValue: AnyObject?
-        guard AXUIElementCopyAttributeValue(
-            appElement, kAXFocusedUIElementAttribute as CFString, &focusedValue
-        ) == .success, let focused = focusedValue else { return }
-        let freshElement = focused as! AXUIElement
-
-        let newCursorPos = max(0, min(cursorLocation + cursorDelta, newTextLength))
-        var restoredRange = CFRange(location: newCursorPos, length: 0)
-        if let cursorValue = AXValueCreate(.cfRange, &restoredRange) {
-            AXUIElementSetAttributeValue(
-                freshElement, kAXSelectedTextRangeAttribute as CFString, cursorValue
-            )
-        }
     }
 
     /// Clipboard fallback when text was read & fixed but AX write failed (web/Electron apps).
@@ -1019,7 +606,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private func writeBackViaClipboardToApp(
         _ targetApp: NSRunningApplication,
         fixedText: String,
-        original: String
+        original _: String
     ) {
         let snap = clipboardManager.snapshot()
         clipboardManager.writePlainText(fixedText)
@@ -1033,13 +620,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             self.clipboardManager.simulateSelectAllShortcut(using: .annotatedSession)
 
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                let pasted = self.clipboardManager.simulatePasteShortcut(using: .annotatedSession)
+                _ = self.clipboardManager.simulatePasteShortcut(using: .annotatedSession)
                     || self.clipboardManager.simulatePasteShortcut(using: .hidSystem)
-
-                if pasted {
-                    self.recordLocalFixHistoryEntry(original: original, fixed: fixedText)
-                    self.showHUDWithDiff(original: original, fixed: fixedText, toolsUsed: "Harper + Dictionary")
-                }
 
                 // Restore clipboard after a short delay (cancellable)
                 self.pendingClipboardRestore?.cancel()
@@ -1054,302 +636,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Full clipboard round-trip fallback when AX read also failed.
-    /// Copies text via Cmd+A → Cmd+C, fixes it, pastes back via Cmd+V.
-    private func handleLocalFixViaClipboard() {
-        guard let targetApp = NSWorkspace.shared.frontmostApplication,
-              targetApp.bundleIdentifier != Bundle.main.bundleIdentifier else {
-            if let cached = lastExternalActiveApp, !cached.isTerminated {
-                handleLocalFixViaClipboardInApp(cached)
-                return
-            }
-            playErrorSound()
-            return
-        }
-        handleLocalFixViaClipboardInApp(targetApp)
-    }
-
-    private func handleLocalFixViaClipboardInApp(_ targetApp: NSRunningApplication) {
-        let snap = clipboardManager.snapshot()
-        let sentinel = "__GHOSTEDIT_LOCALFIX_\(UUID().uuidString)__"
-        clipboardManager.writePlainText(sentinel)
-
-        targetApp.activate(options: [.activateAllWindows])
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self] in
-            guard let self else { return }
-
-            // Try copying just the selection first (no cmd+A)
-            self.clipboardManager.simulateCopyShortcut(using: .annotatedSession)
-
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                let clipContent = NSPasteboard.general.string(forType: .string) ?? ""
-                if clipContent != sentinel && !clipContent.isEmpty {
-                    // Selection was copied — proceed with just the selected text
-                    self.proceedWithClipboardFix(copiedText: clipContent, snapshot: snap, targetApp: targetApp)
-                } else {
-                    // Nothing was selected — fall back to select-all
-                    self.clipboardManager.simulateSelectAllShortcut(using: .annotatedSession)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                        self.clipboardManager.simulateCopyShortcut(using: .annotatedSession)
-                        self.waitForCopiedText(sentinel: sentinel, timeoutSeconds: 1.4) { [weak self] copiedText in
-                            guard let self else { return }
-                            guard let copiedText, !copiedText.isEmpty else {
-                                self.clipboardManager.restore(snap)
-                                self.playErrorSound()
-                                return
-                            }
-                            self.proceedWithClipboardFix(copiedText: copiedText, snapshot: snap, targetApp: targetApp)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private func proceedWithClipboardFix(copiedText: String, snapshot: ClipboardManager.Snapshot, targetApp: NSRunningApplication) {
-        // Apply rule-based fixes
-        let fixedText = applyRuleBasedTextFixes(copiedText)
-
-        guard fixedText != copiedText else {
-            // No changes needed
-            clipboardManager.restore(snapshot)
-            showHUD(state: .success)
-            return
-        }
-
-        // Paste fixed text back
-        clipboardManager.writePlainText(fixedText)
-        let pasted = clipboardManager.simulatePasteShortcut(using: .annotatedSession)
-            || clipboardManager.simulatePasteShortcut(using: .hidSystem)
-
-        if pasted {
-            recordLocalFixHistoryEntry(original: copiedText, fixed: fixedText)
-            showHUDWithDiff(original: copiedText, fixed: fixedText, toolsUsed: "Harper + Dictionary")
-        } else {
-            playErrorSound()
-        }
-
-        // Restore clipboard after a short delay (cancellable)
-        pendingClipboardRestore?.cancel()
-        let restoreItem = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.pendingClipboardRestore = nil
-            self.clipboardManager.restore(snapshot)
-        }
-        pendingClipboardRestore = restoreItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.20, execute: restoreItem)
-    }
-
-    /// Pure-text spell polish using Harper + NSSpellChecker (no AX writes).
-    /// Returns the corrected text, or the original if no fixes were found.
-    /// Runs up to 3 iterative passes so that fixes revealed by earlier corrections
-    /// (e.g. missing commas that become detectable after spelling fixes) are caught.
-    private func applyRuleBasedTextFixes(_ text: String) -> String {
-        var current = text
-        for _ in 0..<3 {
-            let harperIssues = HarperLinter.lint(current)
-            let nsIssues = performLocalSpellCheck(current)
-            let allIssues = mergeIssues(harper: harperIssues, nsChecker: nsIssues, text: current)
-            // Filter out issues that would mutate protected tokens (@mentions, :emoji:, URLs, etc.)
-            // but allow fixes that only add punctuation around them (e.g. @Chema → @Chema,)
-            let tokenRanges = TokenPreservationSupport.tokenRanges(in: current)
-            let nsCurrent = current as NSString
-            let safeIssues = tokenRanges.isEmpty ? allIssues : allIssues.filter { issue in
-                let overlapping = tokenRanges.filter { $0.intersection(issue.range) != nil }
-                guard !overlapping.isEmpty else { return true }
-                guard let suggestion = issue.suggestions.first else { return false }
-                return overlapping.allSatisfy { tokenRange in
-                    guard tokenRange.location + tokenRange.length <= nsCurrent.length else { return false }
-                    let tokenText = nsCurrent.substring(with: tokenRange)
-                    return suggestion.contains(tokenText)
-                }
-            }
-            let fixable = safeIssues.filter { !$0.suggestions.isEmpty }
-                .sorted { $0.range.location > $1.range.location }
-            guard !fixable.isEmpty else { break }
-            var nsText = current as NSString
-            for issue in fixable {
-                let range = issue.range
-                guard range.location + range.length <= nsText.length else { continue }
-                let wordAtRange = nsText.substring(with: range)
-                guard wordAtRange == issue.word, let replacement = issue.suggestions.first else { continue }
-                nsText = nsText.replacingCharacters(in: range, with: replacement) as NSString
-            }
-            let updated = nsText as String
-            if updated == current { break }
-            current = updated
-        }
-        return current
-    }
-
-    /// Apply fixes using Harper + NSSpellChecker (rule-based fallback).
-    /// When `lineRange` and `fullText` are provided (Notes app), fixes are applied to the line text
-    /// and the full document is reconstructed before writing back via AX.
-    @discardableResult
-    private func applyRuleBasedFixes(
-        text: String, pid: pid_t, element: AXUIElement, cursorLocation: Int,
-        lineRange: NSRange? = nil, fullText: String? = nil
-    ) -> String? {
-        let harperIssues = HarperLinter.lint(text)
-        let nsIssues = performLocalSpellCheck(text)
-
-        let allIssues = mergeIssues(harper: harperIssues, nsChecker: nsIssues, text: text)
-        // Filter out issues that would mutate protected tokens (@mentions, :emoji:, URLs, etc.)
-        // but allow fixes that only add punctuation around them (e.g. @Chema → @Chema,)
-        let tokenRanges = TokenPreservationSupport.tokenRanges(in: text)
-        let nsInput = text as NSString
-        let safeIssues = tokenRanges.isEmpty ? allIssues : allIssues.filter { issue in
-            let overlapping = tokenRanges.filter { $0.intersection(issue.range) != nil }
-            guard !overlapping.isEmpty else { return true }
-            guard let suggestion = issue.suggestions.first else { return false }
-            return overlapping.allSatisfy { tokenRange in
-                guard tokenRange.location + tokenRange.length <= nsInput.length else { return false }
-                let tokenText = nsInput.substring(with: tokenRange)
-                return suggestion.contains(tokenText)
-            }
-        }
-        let fixable = safeIssues.filter { !$0.suggestions.isEmpty }
-            .sorted { $0.range.location > $1.range.location }
-
-        guard !fixable.isEmpty else {
-            showHUD(state: .success)
-            return nil
-        }
-
-        var nsText = text as NSString
-        var fixCount = 0
-        var cursorDelta = 0
-        for issue in fixable {
-            let range = issue.range
-            guard range.location + range.length <= nsText.length else { continue }
-            let wordAtRange = nsText.substring(with: range)
-            guard wordAtRange == issue.word, let replacement = issue.suggestions.first else { continue }
-            nsText = nsText.replacingCharacters(in: range, with: replacement) as NSString
-            fixCount += 1
-            if range.location < cursorLocation {
-                cursorDelta += (replacement as NSString).length - range.length
-            }
-        }
-
-        if fixCount > 0 {
-            if let lineRange = lineRange, let fullText = fullText {
-                // Reconstruct full document with fixed line and place cursor at end of fixed line
-                let fixedLine = nsText as String
-                _ = writeBackCorrectedLine(
-                    correctedLine: fixedLine, lineRange: lineRange,
-                    fullText: fullText, pid: pid
-                )
-            } else {
-                // Try per-word replacement first (preserves cursor in apps like Slack)
-                let perWordSuccess = applyPerWordFixes(
-                    fixable: fixable, text: text, pid: pid, element: element
-                )
-                if !perWordSuccess {
-                    // Fall back to full-text replacement
-                    AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, nsText as CFTypeRef)
-                    restoreCursorPosition(
-                        pid: pid, cursorLocation: cursorLocation,
-                        newTextLength: nsText.length, cursorDelta: cursorDelta
-                    )
-                }
-            }
-            showHUD(state: .successWithCount(fixCount))
-            return nsText as String
-        } else {
-            showHUD(state: .success)
-            return nil
-        }
-    }
-
-    /// Apply fixes one word at a time using AX selected text range to preserve cursor position.
-    private func applyPerWordFixes(
-        fixable: [SpellCheckIssue],
-        text: String,
-        pid: pid_t,
-        element: AXUIElement
-    ) -> Bool {
-        // Apply in reverse order so earlier ranges stay valid
-        let sorted = fixable.sorted { $0.range.location > $1.range.location }
-        for issue in sorted {
-            guard let replacement = issue.suggestions.first else { continue }
-            let range = issue.range
-
-            // Select the word range
-            var cfRange = CFRange(location: range.location, length: range.length)
-            guard let rangeValue = AXValueCreate(.cfRange, &cfRange) else { return false }
-            let selectResult = AXUIElementSetAttributeValue(
-                element, kAXSelectedTextRangeAttribute as CFString, rangeValue
-            )
-            guard selectResult == .success else { return false }
-
-            // Replace selected text
-            let replaceResult = AXUIElementSetAttributeValue(
-                element, kAXSelectedTextAttribute as CFString, replacement as CFTypeRef
-            )
-            guard replaceResult == .success else { return false }
-        }
-        return true
-    }
-
-    /// Perform a local NSSpellChecker check (reused from LiveFeedbackController).
-    private func performLocalSpellCheck(_ text: String) -> [SpellCheckIssue] {
-        guard SpellCheckSupport.shouldCheck(text: text) else { return [] }
-        let checker = NSSpellChecker.shared
-        let nsText = text as NSString
-        var issues: [SpellCheckIssue] = []
-        let checkingTypes: NSTextCheckingTypes =
-            NSTextCheckingResult.CheckingType.spelling.rawValue |
-            NSTextCheckingResult.CheckingType.grammar.rawValue |
-            NSTextCheckingResult.CheckingType.correction.rawValue |
-            NSTextCheckingResult.CheckingType.quote.rawValue |
-            NSTextCheckingResult.CheckingType.dash.rawValue |
-            NSTextCheckingResult.CheckingType.replacement.rawValue
-        let results = checker.check(text, range: NSRange(location: 0, length: nsText.length),
-                                    types: checkingTypes, options: nil,
-                                    inSpellDocumentWithTag: 0, orthography: nil, wordCount: nil)
-        for result in results {
-            switch result.resultType {
-            case .spelling:
-                let word = nsText.substring(with: result.range)
-                let guesses = checker.guesses(forWordRange: result.range, in: text,
-                                              language: nil, inSpellDocumentWithTag: 0) ?? []
-                issues.append(SpellCheckIssue(word: word, range: result.range, kind: .spelling, suggestions: guesses))
-            case .grammar:
-                for detail in (result.grammarDetails ?? []) {
-                    let detailRange: NSRange
-                    if let rangeValue = detail["NSGrammarRange"] as? NSValue {
-                        detailRange = rangeValue.rangeValue
-                    } else {
-                        detailRange = result.range
-                    }
-                    guard detailRange.location + detailRange.length <= nsText.length else { continue }
-                    let word = nsText.substring(with: detailRange)
-                    let corrections = detail["NSGrammarCorrections"] as? [String] ?? []
-                    issues.append(SpellCheckIssue(word: word, range: detailRange, kind: .grammar, suggestions: corrections))
-                }
-            case .correction:
-                if let replacement = result.replacementString {
-                    let word = nsText.substring(with: result.range)
-                    issues.append(SpellCheckIssue(word: word, range: result.range, kind: .spelling, suggestions: [replacement]))
-                }
-            case .quote, .dash, .replacement:
-                if let replacement = result.replacementString {
-                    let word = nsText.substring(with: result.range)
-                    issues.append(SpellCheckIssue(word: word, range: result.range, kind: .style, suggestions: [replacement]))
-                }
-            default: break
-            }
-        }
-        return issues
-    }
-
-    /// Merge Harper and NSSpellChecker issues, preferring Harper when ranges overlap.
-    private func mergeIssues(harper: [SpellCheckIssue], nsChecker: [SpellCheckIssue], text: String) -> [SpellCheckIssue] {
-        LocalFixSupport.mergeIssues(harper: harper, nsChecker: nsChecker, text: text)
-    }
-
-    // MARK: - Cloud Fix Pipeline (cmd+shift+E)
+    // MARK: - Correction Pipeline
 
     private func handleHotkeyTrigger() {
         pendingClipboardRestore?.cancel()
@@ -1374,9 +661,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         isProcessing = true
+        correctionGeneration += 1
+        let generation = correctionGeneration
         startProcessingIndicator()
-        showHUD(state: .working)
-
+        pendingFloaterAnchor = focusedSelectionRect(pid: targetApp.processIdentifier)
+        correctionFloater.showLoading(near: pendingFloaterAnchor)
         targetAppAtTrigger = targetApp
         devLog(.textCapture, "Target app: \(targetApp.localizedName ?? targetApp.bundleIdentifier ?? "unknown") (PID \(targetApp.processIdentifier))")
 
@@ -1388,8 +677,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             appPID: targetApp.processIdentifier
         ), !selectedText.contains(TokenPreservationSupport.objectReplacementCharacter) {
             devLog(.textCapture, "Read via Accessibility (\(selectedText.count) chars): \(DeveloperModeSupport.truncate(selectedText))")
-            pendingLineContext = nil
-            processSelectedText(selectedText)
+            processSelectedText(selectedText, generation: generation)
             return
         }
 
@@ -1400,14 +688,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
            let cursorPos = AccessibilityTextSupport.readCursorPosition(appPID: pid),
            let lineInfo = extractLineAtCursor(text: fullText, cursorLocation: cursorPos) {
             devLog(.textCapture, "No selection - extracted line at cursor (\(lineInfo.lineText.count) chars)")
-            pendingLineContext = LineContext(
-                fullText: fullText, lineRange: lineInfo.lineRange,
-                lineText: lineInfo.lineText, pid: pid
-            )
-            processSelectedText(lineInfo.lineText)
+            processSelectedText(lineInfo.lineText, generation: generation)
             return
         }
-        pendingLineContext = nil
 
         devLog(.textCapture, "Accessibility read failed or contained U+FFFC, falling back to clipboard")
 
@@ -1418,7 +701,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         clipboardManager.writePlainText(sentinel)
 
         let strategies: [ClipboardManager.ShortcutPosting] = [.annotatedSession, .hidSystem]
-        attemptCopySelection(sentinel: sentinel, strategies: strategies, index: 0)
+        attemptCopySelection(sentinel: sentinel, strategies: strategies, index: 0, generation: generation)
     }
 
     private func resolveTargetApplication() -> NSRunningApplication? {
@@ -1437,13 +720,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private func attemptCopySelection(
         sentinel: String,
         strategies: [ClipboardManager.ShortcutPosting],
-        index: Int
+        index: Int,
+        generation: Int
     ) {
+        guard generation == correctionGeneration else { return }
         guard index < strategies.count else {
             playErrorSound()
             restoreClipboardSnapshot(after: 0)
             setStatus("No text selected")
-            updateHUD(state: .error("No text selected. Focus a text field and try again."))
+            correctionFloater.showError("No text selected. Focus a text field and try again.", near: pendingFloaterAnchor)
             finishProcessing()
             return
         }
@@ -1453,22 +738,22 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Give the triggering key chord enough time to release.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self] in
-            guard let self else { return }
+            guard let self, generation == self.correctionGeneration else { return }
             self.targetAppAtTrigger?.activate(options: [.activateAllWindows])
 
             guard self.clipboardManager.simulateCopyShortcut(using: strategy) else {
-                self.attemptCopySelection(sentinel: sentinel, strategies: strategies, index: index + 1)
+                self.attemptCopySelection(sentinel: sentinel, strategies: strategies, index: index + 1, generation: generation)
                 return
             }
 
             self.waitForCopiedText(sentinel: sentinel, timeoutSeconds: 1.4) { [weak self] selectedText in
                 guard let self else { return }
                 if let selectedText {
-                    self.processSelectedText(selectedText)
+                    self.processSelectedText(selectedText, generation: generation)
                     return
                 }
 
-                self.attemptCopySelection(sentinel: sentinel, strategies: strategies, index: index + 1)
+                self.attemptCopySelection(sentinel: sentinel, strategies: strategies, index: index + 1, generation: generation)
             }
         }
     }
@@ -1509,8 +794,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         poll()
     }
 
-    private func processSelectedText(_ selectedText: String) {
-        pendingDiffOriginalText = selectedText
+    private func processSelectedText(_ selectedText: String, generation: Int) {
+        guard generation == correctionGeneration else { return }
         let prompt: String
         let baseConfig = configManager.loadConfig()
 
@@ -1540,7 +825,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             } catch {
                 let message = "Could not read prompt file.\n\n\(error.localizedDescription)"
                 restoreClipboardSnapshot(after: 0)
-                dismissHUD()
+                correctionFloater.showError(message, near: pendingFloaterAnchor)
                 notifyFailure(body: "Correction Failed. \(message)")
                 showFailureAlert(title: "Correction Failed", message: message)
                 setStatus("Failed to read prompt file")
@@ -1553,88 +838,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         devLog(.cliExecution, "Processing with \(provider.executableName) (\(modelDisplay))")
         setStatus("Processing with \(provider.executableName) (\(modelDisplay))...")
 
-        // Streaming preview path: show a floating panel that updates in real-time.
-        if config.showDiffPreview {
-            dismissHUD()
-            stopProcessingIndicator()
-            // Bind the preview to the source field, selection and contents, not
-            // merely the application's PID (the user can edit while it is open).
-            let source = targetAppAtTrigger.flatMap { PreviewSource.capture(pid: $0.processIdentifier) }
-
-            let controller = StreamingPreviewController(
-                originalText: selectedText,
-                onAccept: { [weak self] correctedText in
-                    guard let self else { return }
-                    self.streamingPreviewController = nil
-                    if config.clipboardOnlyMode || self.targetAppAtTrigger?.isTerminated == true {
-                        self.clipboardManager.writePlainText(correctedText)
-                        self.clipboardSnapshot = nil
-                        self.setStatus("Corrected text copied to clipboard")
-                        self.targetAppAtTrigger?.activate(options: [.activateAllWindows])
-                        self.finishProcessing()
-                        return
-                    }
-                    self.targetAppAtTrigger?.activate(options: [.activateAllWindows])
-                    self.pendingPreviewSource = source
-                    self.applyCorrectedText(correctedText)
-                },
-                onCopy: { [weak self] correctedText in
-                    self?.copyCorrectionResult(correctedText)
-                },
-                onDismiss: { [weak self] reason in
-                    guard let self else { return }
-                    self.streamingPreviewController = nil
-                    switch reason {
-                    case .cancelled:
-                        self.targetAppAtTrigger?.activate(options: [.activateAllWindows])
-                        self.setStatus("Correction cancelled")
-                    case .noChanges:
-                        if NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier,
-                           NSApp.keyWindow == nil {
-                            self.targetAppAtTrigger?.activate(options: [.activateAllWindows])
-                        }
-                        self.setStatus("No changes needed")
-                    case .focusChanged:
-                        self.setStatus("Correction preview dismissed")
-                    }
-                    self.restoreClipboardSnapshot(after: 0)
-                    self.finishProcessing()
-                },
-                onRegenerate: { }
-            )
-            controller.successDismissDelay = TimeInterval(config.diffPreviewDuration)
-            controller.validateAcceptance = { [weak self] in
-                guard let self else { return "Correction is no longer active." }
-                if config.clipboardOnlyMode || self.targetAppAtTrigger?.isTerminated == true { return nil }
-                guard let source, source.isUnchanged else {
-                    return "Source field, text or selection changed. Result kept here; copy it or cancel and run again."
-                }
-                return nil
-            }
-            controller.onRegenerate = { [weak self, weak controller] in
-                guard let self, let controller else { return }
-                self.launchStreamingRequest(
-                    controller: controller,
-                    prompt: prompt,
-                    selectedText: selectedText,
-                    provider: provider,
-                    model: model
-                )
-            }
-            streamingPreviewController = controller
-            controller.showWindow(nil)
-            controller.window?.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-
-            launchStreamingRequest(
-                controller: controller,
-                prompt: prompt,
-                selectedText: selectedText,
-                provider: provider,
-                model: model
-            )
-            return
-        }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
@@ -1654,121 +857,42 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 )
 
                 DispatchQueue.main.async {
+                    guard generation == self.correctionGeneration else { return }
                     self.updateTooltip(
                         original: selectedText,
                         corrected: correctedText,
                         provider: provider.displayName,
                         model: model
                     )
-
-                    // Check if target app was terminated during processing.
-                    if let targetApp = self.targetAppAtTrigger, targetApp.isTerminated {
-                        self.clipboardManager.writePlainText(correctedText)
-                        self.clipboardSnapshot = nil
-                        self.dismissHUD()
-                        self.setStatus("Target app closed; corrected text on clipboard")
-                        self.playSuccessSound()
-                        self.notifySuccessIfEnabled()
-                        self.finishProcessing()
-                        return
-                    }
-
-                    // Clipboard-only mode: write to clipboard without pasting back.
-                    if config.clipboardOnlyMode {
-                        self.clipboardManager.writePlainText(correctedText)
-                        self.clipboardSnapshot = nil
-                        let time = self.timeFormatter.string(from: Date())
-                        self.setStatus("Corrected text copied to clipboard at \(time)")
-                        self.updateHUD(state: .successWithCount(correctedText.count))
-                        self.playSuccessSound()
-                        self.notifySuccessIfEnabled()
-                        self.finishProcessing()
-                        return
-                    }
-
-                    self.devLog(.pasteBack, "Corrected text (\(correctedText.count) chars): \(DeveloperModeSupport.truncate(correctedText))")
-
-                    // Line-at-cursor write-back for cloud hotkey
-                    if let ctx = self.pendingLineContext {
-                        self.devLog(.pasteBack, "Writing back corrected line via AX")
-                        if self.writeBackCorrectedLine(
-                            correctedLine: correctedText, lineRange: ctx.lineRange,
-                            fullText: ctx.fullText, pid: ctx.pid
-                        ) {
-                            if let original = self.pendingDiffOriginalText {
-                                self.updateHUDWithDiff(original: original, corrected: correctedText)
-                            } else {
-                                self.updateHUD(state: .successWithCount(correctedText.count))
-                            }
-                            let time = self.timeFormatter.string(from: Date())
-                            self.setStatus("Last correction succeeded at \(time)")
-                            self.restoreClipboardSnapshot(after: 0)
-                            self.playSuccessSound()
-                            self.notifySuccessIfEnabled()
-                            self.finishProcessing()
-                            return
-                        }
-                    }
-
-                    // Try accessibility-based text replacement first (fastest path).
-                    // Works on background apps - no focus changes needed.
-                    if let targetApp = self.targetAppAtTrigger {
-                        self.devLog(.pasteBack, "Attempting AX text replacement")
-                        let axReplaced = AccessibilityTextSupport.replaceSelectedText(
-                            appPID: targetApp.processIdentifier,
-                            with: correctedText
-                        )
-                        if axReplaced {
-                            // Verify after a short delay - some apps (e.g. TextEdit) need
-                            // time to commit the AX change, while Electron apps (Slack,
-                            // Discord, VS Code) accept the call but never actually replace.
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                                let readBack = AccessibilityTextSupport.readSelectedText(
-                                    appPID: targetApp.processIdentifier
-                                )
-                                if readBack == correctedText || readBack == nil {
-                                    // Verified: either text still selected and matches (TextEdit),
-                                    // or app deselected after successful replacement (Notes, Mail).
-                                    self.devLog(.pasteBack, "AX replacement verified successfully")
-                                    if let original = self.pendingDiffOriginalText {
-                                        self.updateHUDWithDiff(original: original, corrected: correctedText)
-                                    } else {
-                                        self.updateHUD(state: .successWithCount(correctedText.count))
-                                    }
-                                    let time = self.timeFormatter.string(from: Date())
-                                    self.setStatus("Last correction succeeded at \(time)")
-                                    self.restoreClipboardSnapshot(after: 0)
-                                    self.playSuccessSound()
-                                    self.notifySuccessIfEnabled()
-                                    self.finishProcessing()
-                                } else {
-                                    // readBack is non-empty but different - AX accepted the call
-                                    // but didn't actually replace (Electron: Slack, Discord, VS Code).
-                                    self.devLog(.pasteBack, "AX replacement not verified, falling back to clipboard paste")
-                                    self.pasteViaClipboard(correctedText: correctedText)
-                                }
-                            }
-                            return
-                        }
-                    }
-
-                    // AX replacement not available - go straight to clipboard paste.
-                    self.pasteViaClipboard(correctedText: correctedText)
+                    self.presentCorrection(original: selectedText, corrected: correctedText)
                 }
             } catch {
-                // Try fallback model if the error is retriable.
+                // Try the next cached model if the error is retriable.
+                let catalog = ModelCatalogSupport.load(
+                    from: configManager.baseDirectoryURL.appendingPathComponent("model-cache.json")
+                )
+                let endpoint = ModelCatalogSupport.endpoint(
+                    provider: provider.rawValue,
+                    ollamaBaseURL: config.ollamaBaseURL,
+                    magpieBaseURL: config.magpieBaseURL
+                )
+                let models = ModelCatalogSupport.models(
+                    in: catalog,
+                    key: ModelCatalogSupport.cacheKey(provider: provider.rawValue, endpoint: endpoint)
+                )
                 if FallbackSupport.isRetriable(error),
-                   let fallbackModel = FallbackSupport.nextFallbackModel(
-                       currentModel: model,
-                       provider: provider
-                   ) {
+                   let fallbackModel = FallbackSupport.nextFallbackModel(currentModel: model, models: models) {
                     DispatchQueue.main.async {
+                        guard generation == self.correctionGeneration else { return }
                         self.devLog(.cliExecution, "Retrying with fallback model: \(fallbackModel)")
                         self.setStatus("Retrying with \(fallbackModel)...")
                     }
                     do {
-                        var retryConfig = config
+                        let stored = self.configManager.loadConfig()
+                        var retryConfig = stored
                         retryConfig.model = fallbackModel
+                        try self.configManager.saveConfig(retryConfig)
+                        defer { try? self.configManager.saveConfig(stored) }
                         let correctedText = try self.shellRunner.correctTextPreservingTokens(
                             systemPrompt: prompt,
                             selectedText: selectedText
@@ -1782,13 +906,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                             succeeded: true
                         )
                         DispatchQueue.main.async {
+                            guard generation == self.correctionGeneration else { return }
                             self.updateTooltip(
                                 original: selectedText,
                                 corrected: correctedText,
                                 provider: provider.displayName,
                                 model: fallbackModel
                             )
-                            self.pasteViaClipboard(correctedText: correctedText)
+                            self.presentCorrection(original: selectedText, corrected: correctedText)
                         }
                         return
                     } catch {
@@ -1797,6 +922,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
 
                 DispatchQueue.main.async {
+                    guard generation == self.correctionGeneration else { return }
                     self.restoreClipboardSnapshot(after: 0)
                     self.recordHistoryEntry(
                         originalText: selectedText,
@@ -1806,7 +932,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                         startedAt: startedAt,
                         succeeded: false
                     )
-                    self.dismissHUD()
+                    self.correctionFloater.showError(error.localizedDescription, near: self.pendingFloaterAnchor)
                     self.handleProcessingError(error)
                     self.finishProcessing()
                 }
@@ -1814,96 +940,76 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: - Streaming
-    private struct PreviewSource {
-        let pid: pid_t
-        let element: AXUIElement
-        let text: String?
-        let selectedText: String?
-        let range: CFTypeRef
-
-        static func capture(pid: pid_t) -> PreviewSource? {
-            let provider = SystemAXElementProvider()
-            let (error, focused) = provider.copyAttribute(
-                provider.createApplication(pid), kAXFocusedUIElementAttribute
-            )
-            guard error == .success, let focused,
-                  CFGetTypeID(focused) == AXUIElementGetTypeID() else { return nil }
-            let element = focused as! AXUIElement
-            let (_, value) = provider.copyAttribute(element, kAXValueAttribute)
-            let (_, selected) = provider.copyAttribute(element, kAXSelectedTextAttribute)
-            let (_, range) = provider.copyAttribute(element, kAXSelectedTextRangeAttribute)
-            guard let range, value is String || selected is String else { return nil }
-            return PreviewSource(pid: pid, element: element, text: value as? String,
-                                 selectedText: selected as? String, range: range)
+    private func presentCorrection(original: String, corrected: String) {
+        restoreClipboardSnapshot(after: 0)
+        let anchor = pendingFloaterAnchor
+        if corrected == original {
+            correctionFloater.showUnchanged(near: anchor)
+            setStatus("No changes needed")
+        } else {
+            correctionFloater.editBoxOpacity = CGFloat(configManager.loadConfig().floaterOpacity)
+            correctionFloater.showCorrection(original: original, corrected: corrected, near: anchor)
+            setStatus("Correction ready to copy")
+            playSuccessSound()
+            notifySuccessIfEnabled()
         }
-
-        var isUnchanged: Bool {
-            guard let current = Self.capture(pid: pid) else { return false }
-            return CFEqual(element, current.element)
-                && text == current.text
-                && selectedText == current.selectedText
-                && CFEqual(range, current.range)
-        }
+        finishProcessing()
     }
 
-    private func launchStreamingRequest(
-        controller: StreamingPreviewController,
-        prompt: String,
-        selectedText: String,
-        provider: CLIProvider,
-        model: String
-    ) {
-        let startedAt = Date()
-        let requestID = controller.requestID
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            do {
-                let correctedText = try self.shellRunner.correctTextStreamingPreservingTokens(
-                    systemPrompt: prompt,
-                    selectedText: selectedText,
-                    onChunk: { accumulated in
-                        guard self.streamingPreviewController === controller,
-                              controller.isCurrentRequest(requestID) else { return }
-                        controller.updateStreaming(accumulatedText: accumulated)
-                    }
-                )
-                DispatchQueue.main.async {
-                    guard self.streamingPreviewController === controller,
-                          controller.isCurrentRequest(requestID) else { return }
-                    self.recordHistoryEntry(
-                        originalText: selectedText,
-                        generatedText: correctedText,
-                        provider: provider,
-                        model: model,
-                        startedAt: startedAt,
-                        succeeded: true
-                    )
-                    self.updateTooltip(
-                        original: selectedText,
-                        corrected: correctedText,
-                        provider: provider.displayName,
-                        model: model
-                    )
-                    controller.markComplete(correctedText: correctedText)
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    guard self.streamingPreviewController === controller,
-                          controller.isCurrentRequest(requestID) else { return }
-                    self.recordHistoryEntry(
-                        originalText: selectedText,
-                        generatedText: "",
-                        provider: provider,
-                        model: model,
-                        startedAt: startedAt,
-                        succeeded: false
-                    )
-                    controller.showError(error.localizedDescription)
-                    self.setStatus("Correction failed; Retry or Cancel in preview")
-                }
-            }
+    private func focusedSelectionRect(pid: pid_t) -> CGRect? {
+        let app = AXUIElementCreateApplication(pid)
+        var focused: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
+              let focused,
+              CFGetTypeID(focused) == AXUIElementGetTypeID() else {
+            return nil
         }
+        let element = focused as! AXUIElement
+        var selectedRange: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &selectedRange) == .success,
+              let selectedRange,
+              CFGetTypeID(selectedRange) == AXValueGetTypeID() else {
+            return nil
+        }
+        var range = CFRange(location: 0, length: 0)
+        guard AXValueGetValue(selectedRange as! AXValue, .cfRange, &range), range.location >= 0 else {
+            return nil
+        }
+        // The union box of a long selection sits at the field's left edge. The last
+        // character is the point next to the selected text.
+        var tail = range.length > 1
+            ? CFRange(location: range.location + range.length - 1, length: 1)
+            : range
+        guard let tailValue = AXValueCreate(.cfRange, &tail) else { return nil }
+        var boundsValue: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(
+            element,
+            kAXBoundsForRangeParameterizedAttribute as CFString,
+            tailValue,
+            &boundsValue
+        ) == .success,
+              let boundsValue,
+              CFGetTypeID(boundsValue) == AXValueGetTypeID() else {
+            return nil
+        }
+        var rect = CGRect.zero
+        guard AXValueGetValue(boundsValue as! AXValue, .cgRect, &rect), rect.height > 0 else {
+            return nil
+        }
+        if rect.width < 1 { rect.size.width = 1 }
+        return Self.cocoaRect(fromTopLeftScreenRect: rect)
+    }
+
+    private static func cocoaRect(fromTopLeftScreenRect rect: CGRect) -> CGRect {
+        let height = NSScreen.screens.first { $0.frame.origin == .zero }?.frame.height
+            ?? NSScreen.main?.frame.height
+            ?? 0
+        return CGRect(
+            x: rect.origin.x,
+            y: height - rect.origin.y - rect.height,
+            width: rect.width,
+            height: rect.height
+        )
     }
 
     private func handleProcessingError(_ error: Error) {
@@ -1946,7 +1052,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startProcessingIndicator() {
         runNowMenuItem?.isEnabled = false
-        undoMenuItem?.isEnabled = false
         writingCoachMenuItem?.isEnabled = false
         statusMenu?.cancelTracking()
         statusItem.menu = nil
@@ -1955,203 +1060,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func stopProcessingIndicator() {
         runNowMenuItem?.isEnabled = true
-        undoMenuItem?.isEnabled = true
         writingCoachMenuItem?.isEnabled = true
         statusItem.menu = statusMenu
         setMenuBarIcon(idleMenuBarIcon)
-    }
-
-    // MARK: - Text Application & Write-back
-
-    private func applyCorrectedText(_ correctedText: String) {
-        devLog(.pasteBack, "Corrected text (\(correctedText.count) chars): \(DeveloperModeSupport.truncate(correctedText))")
-        showHUD(state: .working)
-        startProcessingIndicator()
-
-        // Line-at-cursor write-back for cloud hotkey
-        if let ctx = pendingLineContext {
-            devLog(.pasteBack, "Writing back corrected line via AX")
-            if writeBackCorrectedLine(
-                correctedLine: correctedText, lineRange: ctx.lineRange,
-                fullText: ctx.fullText, pid: ctx.pid
-            ) {
-                if let original = pendingDiffOriginalText {
-                    updateHUDWithDiff(original: original, corrected: correctedText)
-                } else {
-                    updateHUD(state: .successWithCount(correctedText.count))
-                }
-                let time = timeFormatter.string(from: Date())
-                setStatus("Last correction succeeded at \(time)")
-                restoreClipboardSnapshot(after: 0)
-                playSuccessSound()
-                notifySuccessIfEnabled()
-                finishProcessing()
-                return
-            }
-            // Never replace an arbitrary selection after a failed line write.
-            clipboardManager.writePlainText(correctedText)
-            clipboardSnapshot = nil
-            setStatus("Line could not be replaced; corrected text copied to clipboard")
-            dismissHUD()
-            finishProcessing()
-            return
-        }
-
-        if let targetApp = targetAppAtTrigger {
-            devLog(.pasteBack, "Attempting AX text replacement")
-            let axReplaced = AccessibilityTextSupport.replaceSelectedText(
-                appPID: targetApp.processIdentifier,
-                with: correctedText
-            )
-            if axReplaced {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-                    guard let self else { return }
-                    let readBack = AccessibilityTextSupport.readSelectedText(
-                        appPID: targetApp.processIdentifier
-                    )
-                    if readBack == correctedText || readBack == nil {
-                        self.devLog(.pasteBack, "AX replacement verified successfully")
-                        if let original = self.pendingDiffOriginalText {
-                            self.updateHUDWithDiff(original: original, corrected: correctedText)
-                        } else {
-                            self.updateHUD(state: .successWithCount(correctedText.count))
-                        }
-                        let time = self.timeFormatter.string(from: Date())
-                        self.setStatus("Last correction succeeded at \(time)")
-                        self.restoreClipboardSnapshot(after: 0)
-                        self.playSuccessSound()
-                        self.notifySuccessIfEnabled()
-                        self.finishProcessing()
-                    } else {
-                        self.devLog(.pasteBack, "AX replacement not verified, falling back to clipboard paste")
-                        self.pasteViaClipboard(correctedText: correctedText)
-                    }
-                }
-                return
-            }
-        }
-
-        pasteViaClipboard(correctedText: correctedText)
-    }
-
-    private func pasteViaClipboard(correctedText: String) {
-        let userCurrentApp = NSWorkspace.shared.frontmostApplication
-
-        if clipboardSnapshot == nil {
-            clipboardSnapshot = clipboardManager.snapshot()
-        }
-        clipboardManager.writePlainText(correctedText)
-        targetAppAtTrigger?.activate(options: [.activateAllWindows])
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            if let source = self.pendingPreviewSource,
-               !source.isUnchanged
-                || NSWorkspace.shared.frontmostApplication?.processIdentifier != source.pid {
-                // Keep the already copied result, but never paste into a newly
-                // focused field or another application.
-                self.clipboardSnapshot = nil
-                self.setStatus("Source changed; corrected text kept on clipboard")
-                self.dismissHUD()
-                self.finishProcessing()
-                return
-            }
-            let pasted = self.clipboardManager.simulatePasteShortcut(using: .annotatedSession)
-                || self.clipboardManager.simulatePasteShortcut(using: .hidSystem)
-
-            if !pasted {
-                self.playErrorSound()
-                let message = "Could not paste corrected text.\n\nMake sure your cursor is in the target field, then run GhostEdit again."
-                self.notifyFailure(body: "Correction Failed. \(message)")
-                self.showFailureAlert(title: "Correction Failed", message: message)
-                self.setStatus("Paste failed")
-                self.dismissHUD()
-            } else {
-                if let original = self.pendingDiffOriginalText {
-                    self.updateHUDWithDiff(original: original, corrected: correctedText)
-                } else {
-                    self.updateHUD(state: .successWithCount(correctedText.count))
-                }
-                let time = self.timeFormatter.string(from: Date())
-                self.setStatus("Last correction succeeded at \(time)")
-                self.playSuccessSound()
-                self.notifySuccessIfEnabled()
-
-                // Position cursor at end of pasted text (helps Electron apps like Slack, Discord, VS Code)
-                if self.pendingPreviewSource == nil, let targetApp = self.targetAppAtTrigger {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) {
-                        self.positionCursorAtEnd(pid: targetApp.processIdentifier)
-                    }
-                }
-
-                // Restore the user's focus if they switched away from the target app.
-                if self.pendingPreviewSource == nil, let userApp = userCurrentApp,
-                   let targetApp = self.targetAppAtTrigger,
-                   userApp.processIdentifier != targetApp.processIdentifier,
-                   !userApp.isTerminated {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) {
-                        userApp.activate()
-                    }
-                }
-            }
-
-            self.restoreClipboardSnapshot(after: 0.20)
-            self.finishProcessing()
-        }
-    }
-
-    // MARK: - HUD Management
-
-    private func showHUD(state: HUDOverlayState) {
-        if hudController == nil {
-            let controller = HUDOverlayController()
-            controller.onCopy = { [weak self] text in self?.copyCorrectionResult(text) }
-            hudController = controller
-        }
-        hudController?.show(state: state, dismissAfter: successDismissDelay(for: state))
-    }
-
-    private func updateHUD(state: HUDOverlayState) {
-        hudController?.update(state: state, dismissAfter: successDismissDelay(for: state))
-    }
-
-    private func successDismissDelay(for state: HUDOverlayState) -> TimeInterval? {
-        switch state {
-        case .success, .successWithCount, .fallback:
-            return TimeInterval(configManager.loadConfig().diffPreviewDuration)
-        case .working, .successWithDiff, .error:
-            return nil
-        }
-    }
-
-    private func showHUDWithDiff(original: String, fixed: String, toolsUsed: String = "") {
-        let segments = DiffSupport.charDiff(old: original, new: fixed)
-        guard segments.contains(where: { $0.kind != .equal }) else {
-            showHUD(state: .success)
-            return
-        }
-        showHUD(state: .successWithDiff(segments, toolsUsed: toolsUsed))
-    }
-
-    private func updateHUDWithDiff(original: String, corrected: String) {
-        let segments = DiffSupport.charDiff(old: original, new: corrected)
-        guard segments.contains(where: { $0.kind != .equal }) else {
-            updateHUD(state: .success)
-            return
-        }
-        updateHUD(state: .successWithDiff(segments, toolsUsed: ""))
-    }
-
-    private func dismissHUD() {
-        hudController?.dismiss()
     }
 
     // MARK: - Processing State
 
     private func finishProcessing() {
         isProcessing = false
-        pendingDiffOriginalText = nil
-        pendingPreviewSource = nil
-        pendingLineContext = nil
         targetAppAtTrigger = nil
         stopProcessingIndicator()
     }
@@ -2246,7 +1163,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         guard configManager.loadConfig().notifyOnSuccess else { return }
         let content = UNMutableNotificationContent()
         content.title = "GhostEdit"
-        content.body = "Correction applied successfully."
+        content.body = "Correction ready to copy."
         content.sound = .default
 
         let request = UNNotificationRequest(
@@ -2333,8 +1250,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showSettingsWindow() {
         if settingsWindowController == nil {
             settingsWindowController = SettingsWindowController(
-                configManager: configManager,
-                localModelRunner: localModelRunner
+                configManager: configManager
             ) { [weak self] config in
                 guard let self else {
                     return
@@ -2567,7 +1483,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 let response = try self.shellRunner.correctText(
                     systemPrompt: WritingCoachSupport.systemPrompt,
-                    selectedText: writingInput
+                    selectedText: writingInput,
+                    includeLanguageContract: false
                 )
                 let insights = WritingCoachSupport.parseInsights(from: response)
 
@@ -2800,14 +1717,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Clipboard
 
-    private func copyCorrectionResult(_ text: String) {
-        pendingClipboardRestore?.cancel()
-        pendingClipboardRestore = nil
-        clipboardSnapshot = nil
-        clipboardManager.writePlainText(text)
-        setStatus("Corrected text copied to clipboard")
-    }
-
     private func restoreClipboardSnapshot(after delay: TimeInterval) {
         guard let snapshot = clipboardSnapshot else {
             return
@@ -2828,6 +1737,22 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             workItem.perform()
         }
+    }
+
+    private func copyFloaterResult(_ text: String) {
+        pendingClipboardRestore?.cancel()
+        pendingClipboardRestore = nil
+        clipboardSnapshot = nil
+        clipboardManager.writePlainText(text)
+        setStatus("Correction copied")
+    }
+
+    private func cancelInFlightCorrection() {
+        correctionGeneration += 1
+        restoreClipboardSnapshot(after: 0)
+        guard isProcessing else { return }
+        finishProcessing()
+        setStatus("Idle")
     }
 
     // MARK: - Developer Mode
@@ -2864,22 +1789,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         try? historyStore.append(entry, limit: historyLimit)
-        refreshHistoryWindowIfVisible()
-    }
-
-    private func recordLocalFixHistoryEntry(original: String, fixed: String) {
-        let entry = CorrectionHistoryEntry(
-            id: UUID(),
-            timestamp: Date(),
-            originalText: original,
-            generatedText: fixed,
-            provider: "Local",
-            model: "Harper",
-            durationMilliseconds: 0,
-            succeeded: true
-        )
-        let limit = configManager.loadConfig().historyLimit
-        try? historyStore.append(entry, limit: limit)
         refreshHistoryWindowIfVisible()
     }
 

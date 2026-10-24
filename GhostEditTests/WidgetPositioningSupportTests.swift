@@ -227,4 +227,67 @@ final class WidgetPositioningSupportTests: XCTestCase {
         )
         XCTAssertTrue(result.isEmpty)
     }
+
+    func testFloaterOriginFitsBelowAnchor() {
+        let origin = WidgetPositioningSupport.floaterOrigin(
+            anchor: CGRect(x: 100, y: 400, width: 40, height: 20),
+            panelSize: CGSize(width: 80, height: 30),
+            visibleFrame: CGRect(x: 0, y: 0, width: 1000, height: 800),
+            gap: 4
+        )
+        XCTAssertEqual(origin, CGPoint(x: 100, y: 366))
+    }
+
+    func testFloaterOriginMovesAboveWhenNoRoomBelow() {
+        let origin = WidgetPositioningSupport.floaterOrigin(
+            anchor: CGRect(x: 100, y: 10, width: 40, height: 20),
+            panelSize: CGSize(width: 80, height: 30),
+            visibleFrame: CGRect(x: 0, y: 0, width: 1000, height: 800),
+            gap: 4
+        )
+        XCTAssertEqual(origin, CGPoint(x: 100, y: 34))
+    }
+
+    func testFloaterOriginClampsHorizontalAndVerticalOverflow() {
+        let right = WidgetPositioningSupport.floaterOrigin(
+            anchor: CGRect(x: 980, y: 400, width: 40, height: 20),
+            panelSize: CGSize(width: 80, height: 30),
+            visibleFrame: CGRect(x: 0, y: 0, width: 1000, height: 800),
+            gap: 4
+        )
+        XCTAssertEqual(right.x, 920)
+        let left = WidgetPositioningSupport.floaterOrigin(
+            anchor: CGRect(x: -20, y: 400, width: 10, height: 20),
+            panelSize: CGSize(width: 80, height: 30),
+            visibleFrame: CGRect(x: 10, y: 0, width: 1000, height: 800),
+            gap: 4
+        )
+        XCTAssertEqual(left.x, 10)
+        let top = WidgetPositioningSupport.floaterOrigin(
+            anchor: CGRect(x: 40, y: 5, width: 10, height: 790),
+            panelSize: CGSize(width: 80, height: 40),
+            visibleFrame: CGRect(x: 0, y: 0, width: 200, height: 800),
+            gap: 4
+        )
+        XCTAssertEqual(top.y, 760)
+    }
+
+    func testFloaterOriginClampsWhenPanelTallerThanScreen() {
+        let origin = WidgetPositioningSupport.floaterOrigin(
+            anchor: CGRect(x: 10, y: 2, width: 8, height: 4),
+            panelSize: CGSize(width: 40, height: 200),
+            visibleFrame: CGRect(x: 0, y: 0, width: 300, height: 100),
+            gap: 4
+        )
+        XCTAssertEqual(origin, CGPoint(x: 10, y: 0))
+    }
+
+    func testAppKitRectConvertsTopLeftAnchor() {
+        let rect = WidgetPositioningSupport.appKitRect(
+            fromAccessibility: CGRect(x: 10, y: 20, width: 30, height: 40),
+            primaryScreenHeight: 1000
+        )
+        XCTAssertEqual(rect, CGRect(x: 10, y: 940, width: 30, height: 40))
+    }
+
 }

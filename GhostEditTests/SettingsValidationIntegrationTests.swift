@@ -23,9 +23,8 @@ final class SettingsValidationIntegrationTests: XCTestCase {
         // Validate settings
         let result = SettingsValidationSupport.validateAll(
             hotkeyKeyCode: 14, hotkeyModifiers: 256,
-            cloudHotkeyKeyCode: 15, cloudHotkeyModifiers: 768,
             selectedOptionValue: "claude-3", customModel: "claude-3-opus",
-            historyLimitText: "200", timeoutText: "45", diffPreviewDurationText: "10"
+            historyLimitText: "200", timeoutText: "45"
         )
 
         guard case .success(let validated) = result else {
@@ -37,12 +36,9 @@ final class SettingsValidationIntegrationTests: XCTestCase {
         var config = configManager.loadConfig()
         config.hotkeyKeyCode = validated.hotkeyKeyCode
         config.hotkeyModifiers = validated.hotkeyModifiers
-        config.cloudHotkeyKeyCode = validated.cloudHotkeyKeyCode
-        config.cloudHotkeyModifiers = validated.cloudHotkeyModifiers
         config.model = validated.model
         config.historyLimit = validated.historyLimit
         config.timeoutSeconds = validated.timeoutSeconds
-        config.diffPreviewDuration = validated.diffPreviewDuration
         try configManager.saveConfig(config)
 
         // Invalidate cache so we read from disk
@@ -52,21 +48,17 @@ final class SettingsValidationIntegrationTests: XCTestCase {
         let loaded = configManager.loadConfig()
         XCTAssertEqual(loaded.hotkeyKeyCode, 14)
         XCTAssertEqual(loaded.hotkeyModifiers, 256)
-        XCTAssertEqual(loaded.cloudHotkeyKeyCode, 15)
-        XCTAssertEqual(loaded.cloudHotkeyModifiers, 768)
         XCTAssertEqual(loaded.model, "claude-3-opus")
         XCTAssertEqual(loaded.historyLimit, 200)
         XCTAssertEqual(loaded.timeoutSeconds, 45)
-        XCTAssertEqual(loaded.diffPreviewDuration, 10)
     }
 
     func testValidationCascadeStopsAtFirstError() {
         // Missing hotkey key code - should fail immediately
         let result = SettingsValidationSupport.validateAll(
             hotkeyKeyCode: nil, hotkeyModifiers: 256,
-            cloudHotkeyKeyCode: 15, cloudHotkeyModifiers: 768,
             selectedOptionValue: "model", customModel: "claude-3",
-            historyLimitText: "abc", timeoutText: "2", diffPreviewDurationText: "0"
+            historyLimitText: "abc", timeoutText: "2"
         )
         if case .failure(let error) = result {
             // Should fail on first check (hotkey key code), not on later ones
@@ -93,13 +85,10 @@ final class SettingsValidationIntegrationTests: XCTestCase {
         let result = SettingsValidationSupport.validateAll(
             hotkeyKeyCode: config.hotkeyKeyCode,
             hotkeyModifiers: config.hotkeyModifiers,
-            cloudHotkeyKeyCode: config.cloudHotkeyKeyCode,
-            cloudHotkeyModifiers: config.cloudHotkeyModifiers,
             selectedOptionValue: config.model.isEmpty ? nil : config.model,
             customModel: config.model,
             historyLimitText: "\(config.historyLimit)",
-            timeoutText: "\(config.timeoutSeconds)",
-            diffPreviewDurationText: "\(config.diffPreviewDuration)"
+            timeoutText: "\(config.timeoutSeconds)"
         )
         if case .failure(let error) = result {
             XCTFail("Default config should validate: \(error.title)")

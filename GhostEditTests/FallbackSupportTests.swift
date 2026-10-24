@@ -4,48 +4,17 @@ import XCTest
 final class FallbackSupportTests: XCTestCase {
     // MARK: - nextFallbackModel
 
-    func testNextFallbackModelClaudeHaikuToSonnet() {
-        let next = FallbackSupport.nextFallbackModel(currentModel: "haiku", provider: .claude)
-        XCTAssertEqual(next, "sonnet")
+    func testNextFallbackModelReturnsTheFollowingCachedModel() {
+        let models = ["haiku", "sonnet", "opus"]
+        XCTAssertEqual(FallbackSupport.nextFallbackModel(currentModel: "haiku", models: models), "sonnet")
+        XCTAssertEqual(FallbackSupport.nextFallbackModel(currentModel: "sonnet", models: models), "opus")
     }
 
-    func testNextFallbackModelClaudeSonnetToOpus() {
-        let next = FallbackSupport.nextFallbackModel(currentModel: "sonnet", provider: .claude)
-        XCTAssertEqual(next, "opus")
-    }
-
-    func testNextFallbackModelClaudeOpusReturnsNil() {
-        let next = FallbackSupport.nextFallbackModel(currentModel: "opus", provider: .claude)
-        XCTAssertNil(next)
-    }
-
-    func testNextFallbackModelGeminiFlashLiteToFlash() {
-        let next = FallbackSupport.nextFallbackModel(currentModel: "gemini-2.5-flash-lite", provider: .gemini)
-        XCTAssertEqual(next, "gemini-2.5-flash")
-    }
-
-    func testNextFallbackModelUnknownModelFallsToDefault() {
-        let next = FallbackSupport.nextFallbackModel(currentModel: "unknown-model", provider: .claude)
-        XCTAssertEqual(next, "claude-haiku-4-5")
-    }
-
-    func testNextFallbackModelUnknownModelSameAsDefaultReturnsNil() {
-        let next = FallbackSupport.nextFallbackModel(currentModel: "haiku", provider: .claude)
-        // haiku is known, so it goes to next: sonnet
-        XCTAssertEqual(next, "sonnet")
-
-        // If current is "haiku" and that's the default and we don't find it, nil
-        // This case only applies for unknown strings equal to the default.
-        let next2 = FallbackSupport.nextFallbackModel(currentModel: "gpt-5-codex", provider: .codex)
-        XCTAssertEqual(next2, "gpt-5.3-codex")
-    }
-
-    func testNextFallbackModelLastInGeminiList() {
-        let next = FallbackSupport.nextFallbackModel(
-            currentModel: "gemini-3.1-pro-preview-customtools",
-            provider: .gemini
-        )
-        XCTAssertNil(next)
+    func testNextFallbackModelReturnsNilWhenMissingOrLast() {
+        let models = ["grok-4.7", "grok-4.6"]
+        XCTAssertNil(FallbackSupport.nextFallbackModel(currentModel: "missing", models: models))
+        XCTAssertNil(FallbackSupport.nextFallbackModel(currentModel: "grok-4.6", models: models))
+        XCTAssertNil(FallbackSupport.nextFallbackModel(currentModel: "haiku", models: []))
     }
 
     // MARK: - isRetriable

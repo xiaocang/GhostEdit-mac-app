@@ -10,7 +10,6 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         case general
         case hotkey
         case behavior
-        case localModels
         case advanced
 
         var label: String {
@@ -18,7 +17,6 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
             case .general: return "General"
             case .hotkey: return "Hotkey"
             case .behavior: return "Behavior"
-            case .localModels: return "Local Models"
             case .advanced: return "Advanced"
             }
         }
@@ -28,7 +26,6 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
             case .general: return "globe"
             case .hotkey: return "keyboard"
             case .behavior: return "slider.horizontal.3"
-            case .localModels: return "cpu"
             case .advanced: return "wrench.and.screwdriver"
             }
         }
@@ -40,16 +37,16 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
 
     private let configManager: ConfigManager
     private let onConfigSaved: (AppConfig) -> Void
-    private let localModelRunner: LocalModelRunner?
 
     private let providerPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let modelPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let customModelField = NSTextField(string: "")
     private let customModelContainer = NSStackView()
     private let ollamaURLField = NSTextField(string: "")
-    private let ollamaSettingsContainer = NSStackView()
-    private let refreshOllamaModelsButton = NSButton(title: "Refresh Models", target: nil, action: nil)
-    private var installedOllamaModels: [String] = []
+    private let magpieURLField = NSTextField(string: "")
+    private let serverURLContainer = NSStackView()
+    private let refreshModelsButton = NSButton(title: "Refresh Models", target: nil, action: nil)
+    private var cachedModels: [String] = []
     private let hotkeyKeyPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let commandModifierCheckbox = NSButton(checkboxWithTitle: "Command", target: nil, action: nil)
     private let optionModifierCheckbox = NSButton(checkboxWithTitle: "Option", target: nil, action: nil)
@@ -75,16 +72,6 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         target: nil,
         action: nil
     )
-    private let clipboardOnlyModeCheckbox = NSButton(
-        checkboxWithTitle: "Clipboard-only mode (copy corrected text, do not paste back)",
-        target: nil,
-        action: nil
-    )
-    private let showDiffPreviewCheckbox = NSButton(
-        checkboxWithTitle: "Show streaming preview before applying (⌘Return to apply, Esc to cancel)",
-        target: nil,
-        action: nil
-    )
     private let liveFeedbackCheckbox = NSButton(
         checkboxWithTitle: "Enable live spell-check feedback while typing",
         target: nil,
@@ -96,20 +83,12 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         target: nil,
         action: nil
     )
-    private let diffPreviewDurationField = NSTextField(string: "")
+    private let floaterTransparencySlider = NSSlider()
+    private let floaterTransparencyValue = NSTextField(labelWithString: "58%")
+    private let floaterTransparencySwatch = FloaterTransparencySwatch()
     private let hintLabel = NSTextField(labelWithString: "")
     private let hotkeyBadgeView = NSView()
     private let hotkeyBadgeLabel = NSTextField(labelWithString: "")
-
-    // Cloud hotkey UI controls
-    private let cloudHotkeyKeyPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let cloudCommandModifierCheckbox = NSButton(checkboxWithTitle: "Command", target: nil, action: nil)
-    private let cloudOptionModifierCheckbox = NSButton(checkboxWithTitle: "Option", target: nil, action: nil)
-    private let cloudControlModifierCheckbox = NSButton(checkboxWithTitle: "Control", target: nil, action: nil)
-    private let cloudShiftModifierCheckbox = NSButton(checkboxWithTitle: "Shift", target: nil, action: nil)
-    private let cloudHotkeyPreviewLabel = NSTextField(labelWithString: "")
-    private let cloudHotkeyBadgeView = NSView()
-    private let cloudHotkeyBadgeLabel = NSTextField(labelWithString: "")
 
     private var tabViews: [Tab: NSView] = [:]
     private var currentTab: Tab = .general
@@ -118,9 +97,8 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
     private let hotkeyKeyOptions = HotkeySupport.keyOptions
     private var modelOptions: [ModelOption] = []
 
-    init(configManager: ConfigManager, localModelRunner: LocalModelRunner? = nil, onConfigSaved: @escaping (AppConfig) -> Void) {
+    init(configManager: ConfigManager, onConfigSaved: @escaping (AppConfig) -> Void) {
         self.configManager = configManager
-        self.localModelRunner = localModelRunner
         self.onConfigSaved = onConfigSaved
 
         let window = NSWindow(
@@ -144,14 +122,7 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         buildAllTabs()
         loadCurrentValues()
 
-        // Fix window height to the tallest tab so switching never resizes
-        let maxTabHeight = tabViews.values.map { $0.fittingSize.height }.max() ?? SettingsLayoutSupport.minWindowHeight
-        let fixedHeight = max(ceil(maxTabHeight), SettingsLayoutSupport.minWindowHeight)
-        var settingsFrame = window.frame
-        let heightDelta = fixedHeight - settingsFrame.size.height
-        settingsFrame.origin.y -= heightDelta
-        settingsFrame.size.height = fixedHeight
-        window.setFrame(settingsFrame, display: false)
+        fitSettingsWindowHeight()
 
         switchToTab(.general)
     }
@@ -248,1264 +219,13 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         tabViews[.general] = buildGeneralTab()
         tabViews[.hotkey] = buildHotkeyTab()
         tabViews[.behavior] = buildBehaviorTab()
-        tabViews[.localModels] = buildLocalModelsTab()
         tabViews[.advanced] = buildAdvancedTab()
     }
 
-    // MARK: - Local Models Tab
-
-    private var localModelsPythonPathField = NSTextField(string: "")
-    private var localModelsStatusLabel = NSTextField(labelWithString: "")
-    private var localModelsStatusDot = NSTextField(labelWithString: "\u{25CF}")
-    private var localModelsModelRows: NSStackView = NSStackView()
-    private var hfAccountStatusDot = NSTextField(labelWithString: "\u{25CF}")
-    private var hfAccountStatusLabel = NSTextField(labelWithString: "Checking...")
-    private var hfAccountTokenField = NSSecureTextField(string: "")
-    private var hfAccountSaveBtn = NSButton(title: "Save Token", target: nil, action: nil)
-    private var hfAccountLogoutBtn = NSButton(title: "Logout", target: nil, action: nil)
-    private var hfAccountDetailLabel = NSTextField(labelWithString: "")
-
-    private func buildLocalModelsTab() -> NSView {
-        let config = configManager.loadConfig()
-
-        let scrollView = NSScrollView()
-        scrollView.hasVerticalScroller = true
-        scrollView.borderType = .noBorder
-        scrollView.drawsBackground = false
-
-        // Use a flipped clip view so content starts at the top
-        let flippedClip = FlippedClipView()
-        flippedClip.drawsBackground = false
-        scrollView.contentView = flippedClip
-
-        let outerStack = NSStackView()
-        outerStack.orientation = .vertical
-        outerStack.spacing = 20
-        outerStack.alignment = .leading
-        outerStack.translatesAutoresizingMaskIntoConstraints = false
-        outerStack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
-
-        // Section 1: Python Environment
-        let pythonSection = buildLocalModelsPythonSection(config: config)
-        outerStack.addArrangedSubview(pythonSection)
-
-        // Section 2: Available Models
-        let modelsSection = buildLocalModelsModelSection(config: config)
-        outerStack.addArrangedSubview(modelsSection)
-
-        // Section 3: Hugging Face Account
-        let hfSection = buildLocalModelsHFAccountSection()
-        outerStack.addArrangedSubview(hfSection)
-
-        // Section 4: Hardware
-        let hardwareSection = buildLocalModelsHardwareSection()
-        outerStack.addArrangedSubview(hardwareSection)
-
-        scrollView.documentView = outerStack
-        NSLayoutConstraint.activate([
-            outerStack.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
-            outerStack.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
-            outerStack.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
-        ])
-
-        refreshPythonStatus()
-
-        return scrollView
-    }
-
-    private func detectPythonPath() -> String {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let detected = PythonEnvironmentSupport.detectPythonPath(homeDirectoryPath: home)
-        if detected != "/usr/bin/python3" {
-            return detected
-        }
-
-        // Also try resolving via shell (user's login shell has full PATH)
-        let shellProcess = Process()
-        shellProcess.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        shellProcess.arguments = ["-l", "-c", "which python3"]
-        let pipe = Pipe()
-        shellProcess.standardOutput = pipe
-        shellProcess.standardError = FileHandle.nullDevice
-        do {
-            try shellProcess.run()
-            shellProcess.waitUntilExit()
-            if shellProcess.terminationStatus == 0 {
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                if !path.isEmpty && FileManager.default.fileExists(atPath: path) {
-                    return path
-                }
-            }
-        } catch {}
-
-        return detected
-    }
-
-    private func refreshPythonStatus() {
-        let pythonPath = localModelsPythonPathField.stringValue
-        let runner = localModelRunner
-        Task.detached { [weak self] in
-            // First check if the Python binary actually exists
-            let exists = FileManager.default.fileExists(atPath: pythonPath)
-            guard exists else {
-                await MainActor.run {
-                    self?.localModelsStatusDot.textColor = .systemRed
-                    self?.localModelsStatusLabel.stringValue = "Python not found at \(pythonPath)"
-                }
-                return
-            }
-
-            do {
-                let packages = try runner?.checkPythonPackages(pythonPath: pythonPath) ?? [:]
-                let missing = packages.filter { !$0.value }.map(\.key)
-                await MainActor.run { [weak self] in
-                    if missing.isEmpty {
-                        self?.localModelsStatusDot.textColor = .systemGreen
-                        self?.localModelsStatusLabel.stringValue = "Python ready \u{2014} transformers, torch installed"
-                    } else {
-                        self?.localModelsStatusDot.textColor = .systemOrange
-                        self?.localModelsStatusLabel.stringValue = "Missing packages: \(missing.joined(separator: ", "))"
-                    }
-                }
-            } catch let error as LocalModelRunnerError {
-                await MainActor.run { [weak self] in
-                    switch error {
-                    case .scriptNotFound:
-                        self?.localModelsStatusDot.textColor = .systemRed
-                        self?.localModelsStatusLabel.stringValue = "Inference script not found in app bundle"
-                    case .processExitedWithError(let code):
-                        self?.localModelsStatusDot.textColor = .systemOrange
-                        self?.localModelsStatusLabel.stringValue = "Python check failed (exit \(code)) \u{2014} packages may be broken"
-                    default:
-                        self?.localModelsStatusDot.textColor = .systemRed
-                        self?.localModelsStatusLabel.stringValue = "Python check error: \(error.localizedDescription)"
-                    }
-                }
-            } catch {
-                await MainActor.run { [weak self] in
-                    self?.localModelsStatusDot.textColor = .systemRed
-                    self?.localModelsStatusLabel.stringValue = "Python check error: \(error.localizedDescription)"
-                }
-            }
-        }
-    }
-
-    private func buildLocalModelsPythonSection(config: AppConfig) -> NSView {
-        let container = NSView()
-        container.translatesAutoresizingMaskIntoConstraints = false
-
-        let header = NSTextField(labelWithString: "PYTHON ENVIRONMENT")
-        header.font = .systemFont(ofSize: 11, weight: .medium)
-        header.textColor = .secondaryLabelColor
-        header.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(header)
-
-        let card = NSBox()
-        card.boxType = .custom
-        card.cornerRadius = SettingsLayoutSupport.groupCornerRadius
-        card.fillColor = .controlBackgroundColor
-        card.borderColor = .separatorColor
-        card.borderWidth = 0.5
-        card.contentViewMargins = .zero
-        card.titlePosition = .noTitle
-        card.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(card)
-
-        let cardStack = NSStackView()
-        cardStack.orientation = .vertical
-        cardStack.spacing = 10
-        cardStack.translatesAutoresizingMaskIntoConstraints = false
-
-        // Status line
-        let statusStack = NSStackView()
-        statusStack.orientation = .horizontal
-        statusStack.spacing = 6
-        localModelsStatusDot.font = .systemFont(ofSize: 10)
-        localModelsStatusDot.textColor = .systemGray
-        localModelsStatusLabel.font = .systemFont(ofSize: 12)
-        localModelsStatusLabel.textColor = .secondaryLabelColor
-        localModelsStatusLabel.stringValue = "Checking Python..."
-        statusStack.addArrangedSubview(localModelsStatusDot)
-        statusStack.addArrangedSubview(localModelsStatusLabel)
-        cardStack.addArrangedSubview(statusStack)
-
-        // Python path field
-        let pathStack = NSStackView()
-        pathStack.orientation = .horizontal
-        pathStack.spacing = 8
-        let pathLabel = NSTextField(labelWithString: "Python path:")
-        pathLabel.font = .systemFont(ofSize: 12)
-        pathLabel.setContentHuggingPriority(.required, for: .horizontal)
-        localModelsPythonPathField.stringValue = config.localModelPythonPath.isEmpty
-            ? detectPythonPath() : config.localModelPythonPath
-        localModelsPythonPathField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        localModelsPythonPathField.placeholderString = "Auto-detect"
-        localModelsPythonPathField.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            localModelsPythonPathField.widthAnchor.constraint(greaterThanOrEqualToConstant: 280),
-        ])
-        pathStack.addArrangedSubview(pathLabel)
-        pathStack.addArrangedSubview(localModelsPythonPathField)
-        cardStack.addArrangedSubview(pathStack)
-
-        // Install packages button
-        let installBtn = NSButton(title: "Install Packages (pip install transformers torch)", target: self, action: #selector(installPythonPackagesClicked(_:)))
-        installBtn.bezelStyle = .rounded
-        installBtn.font = .systemFont(ofSize: 11)
-        cardStack.addArrangedSubview(installBtn)
-
-        if let cardContent = card.contentView {
-            cardContent.addSubview(cardStack)
-            NSLayoutConstraint.activate([
-                cardStack.topAnchor.constraint(equalTo: cardContent.topAnchor, constant: 14),
-                cardStack.leadingAnchor.constraint(equalTo: cardContent.leadingAnchor, constant: 16),
-                cardStack.trailingAnchor.constraint(equalTo: cardContent.trailingAnchor, constant: -16),
-                cardStack.bottomAnchor.constraint(equalTo: cardContent.bottomAnchor, constant: -14),
-            ])
-        }
-
-        NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: container.topAnchor),
-            header.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 4),
-            card.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 6),
-            card.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            card.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            card.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            container.widthAnchor.constraint(equalToConstant: SettingsLayoutSupport.windowWidth - 40),
-        ])
-
-        return container
-    }
-
-    private func buildLocalModelsModelSection(config: AppConfig) -> NSView {
-        let container = NSView()
-        container.translatesAutoresizingMaskIntoConstraints = false
-
-        let header = NSTextField(labelWithString: "AVAILABLE MODELS")
-        header.font = .systemFont(ofSize: 11, weight: .medium)
-        header.textColor = .secondaryLabelColor
-        header.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(header)
-
-        let card = NSBox()
-        card.boxType = .custom
-        card.cornerRadius = SettingsLayoutSupport.groupCornerRadius
-        card.fillColor = .controlBackgroundColor
-        card.borderColor = .separatorColor
-        card.borderWidth = 0.5
-        card.contentViewMargins = .zero
-        card.titlePosition = .noTitle
-        card.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(card)
-
-        let cardStack = NSStackView()
-        cardStack.orientation = .vertical
-        cardStack.spacing = 10
-        cardStack.translatesAutoresizingMaskIntoConstraints = false
-
-        // Model rows
-        localModelsModelRows = NSStackView()
-        localModelsModelRows.orientation = .vertical
-        localModelsModelRows.spacing = 12
-        refreshModelRows(config: config)
-        cardStack.addArrangedSubview(localModelsModelRows)
-
-        // Test Inference
-        let testBtn = NSButton(title: "Test Inference", target: self, action: #selector(testInferenceClicked(_:)))
-        testBtn.bezelStyle = .rounded
-        testBtn.font = .systemFont(ofSize: 11)
-        cardStack.addArrangedSubview(testBtn)
-
-        // Separator
-        let sep = NSBox()
-        sep.boxType = .separator
-        cardStack.addArrangedSubview(sep)
-
-        // Add custom model
-        let customStack = NSStackView()
-        customStack.orientation = .horizontal
-        customStack.spacing = 8
-        let customLabel = NSTextField(labelWithString: "Add Custom Model:")
-        customLabel.font = .systemFont(ofSize: 11)
-        customLabel.setContentHuggingPriority(.required, for: .horizontal)
-        let customField = NSTextField(string: "")
-        customField.placeholderString = "org/model or https://huggingface.co/org/model"
-        customField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        customField.translatesAutoresizingMaskIntoConstraints = false
-        customField.tag = 9990
-        customField.isEditable = true
-        customField.isSelectable = true
-        NSLayoutConstraint.activate([
-            customField.widthAnchor.constraint(greaterThanOrEqualToConstant: 250),
-        ])
-        let addBtn = NSButton(title: "Add", target: self, action: #selector(addCustomModelClicked(_:)))
-        addBtn.bezelStyle = .rounded
-        addBtn.font = .systemFont(ofSize: 11)
-        customStack.addArrangedSubview(customLabel)
-        customStack.addArrangedSubview(customField)
-        customStack.addArrangedSubview(addBtn)
-        cardStack.addArrangedSubview(customStack)
-
-        if let cardContent = card.contentView {
-            cardContent.addSubview(cardStack)
-            NSLayoutConstraint.activate([
-                cardStack.topAnchor.constraint(equalTo: cardContent.topAnchor, constant: 14),
-                cardStack.leadingAnchor.constraint(equalTo: cardContent.leadingAnchor, constant: 16),
-                cardStack.trailingAnchor.constraint(equalTo: cardContent.trailingAnchor, constant: -16),
-                cardStack.bottomAnchor.constraint(equalTo: cardContent.bottomAnchor, constant: -14),
-            ])
-        }
-
-        NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: container.topAnchor),
-            header.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 4),
-            card.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 6),
-            card.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            card.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            card.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            container.widthAnchor.constraint(equalToConstant: SettingsLayoutSupport.windowWidth - 40),
-        ])
-
-        return container
-    }
-
-    private func buildLocalModelsHFAccountSection() -> NSView {
-        let container = NSView()
-        container.translatesAutoresizingMaskIntoConstraints = false
-
-        let header = NSTextField(labelWithString: "HUGGING FACE ACCOUNT")
-        header.font = .systemFont(ofSize: 11, weight: .medium)
-        header.textColor = .secondaryLabelColor
-        header.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(header)
-
-        let card = NSBox()
-        card.boxType = .custom
-        card.cornerRadius = SettingsLayoutSupport.groupCornerRadius
-        card.fillColor = .controlBackgroundColor
-        card.borderColor = .separatorColor
-        card.borderWidth = 0.5
-        card.contentViewMargins = .zero
-        card.titlePosition = .noTitle
-        card.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(card)
-
-        let cardStack = NSStackView()
-        cardStack.orientation = .vertical
-        cardStack.spacing = 8
-        cardStack.translatesAutoresizingMaskIntoConstraints = false
-
-        // Status row: dot + label + logout button
-        let statusRow = NSStackView()
-        statusRow.orientation = .horizontal
-        statusRow.spacing = 6
-        statusRow.alignment = .centerY
-
-        hfAccountStatusDot.font = .systemFont(ofSize: 10)
-        hfAccountStatusDot.textColor = .secondaryLabelColor
-        hfAccountStatusDot.setContentHuggingPriority(.required, for: .horizontal)
-        statusRow.addArrangedSubview(hfAccountStatusDot)
-
-        hfAccountStatusLabel.font = .systemFont(ofSize: 12)
-        hfAccountStatusLabel.stringValue = "Checking..."
-        hfAccountStatusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        statusRow.addArrangedSubview(hfAccountStatusLabel)
-
-        hfAccountLogoutBtn.bezelStyle = .rounded
-        hfAccountLogoutBtn.font = .systemFont(ofSize: 11)
-        hfAccountLogoutBtn.target = self
-        hfAccountLogoutBtn.action = #selector(hfLogoutClicked(_:))
-        hfAccountLogoutBtn.isHidden = true
-        statusRow.addArrangedSubview(hfAccountLogoutBtn)
-
-        cardStack.addArrangedSubview(statusRow)
-
-        // Detail label (token source info)
-        hfAccountDetailLabel.font = .systemFont(ofSize: 11)
-        hfAccountDetailLabel.textColor = .secondaryLabelColor
-        hfAccountDetailLabel.stringValue = ""
-        cardStack.addArrangedSubview(hfAccountDetailLabel)
-
-        // Token input row
-        let tokenRow = NSStackView()
-        tokenRow.orientation = .horizontal
-        tokenRow.spacing = 8
-        tokenRow.alignment = .centerY
-
-        let tokenLabel = NSTextField(labelWithString: "Token:")
-        tokenLabel.font = .systemFont(ofSize: 11)
-        tokenLabel.setContentHuggingPriority(.required, for: .horizontal)
-        tokenRow.addArrangedSubview(tokenLabel)
-
-        hfAccountTokenField.placeholderString = "hf_..."
-        hfAccountTokenField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        hfAccountTokenField.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            hfAccountTokenField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220),
-        ])
-        tokenRow.addArrangedSubview(hfAccountTokenField)
-
-        hfAccountSaveBtn.bezelStyle = .rounded
-        hfAccountSaveBtn.font = .systemFont(ofSize: 11)
-        hfAccountSaveBtn.target = self
-        hfAccountSaveBtn.action = #selector(hfSaveTokenClicked(_:))
-        tokenRow.addArrangedSubview(hfAccountSaveBtn)
-
-        cardStack.addArrangedSubview(tokenRow)
-
-        // Help text
-        let helpLabel = NSTextField(wrappingLabelWithString: "Get your token at huggingface.co/settings/tokens. Already logged in via huggingface-cli? Your token is auto-detected.")
-        helpLabel.font = .systemFont(ofSize: 10)
-        helpLabel.textColor = .tertiaryLabelColor
-        cardStack.addArrangedSubview(helpLabel)
-
-        if let cardContent = card.contentView {
-            cardContent.addSubview(cardStack)
-            NSLayoutConstraint.activate([
-                cardStack.topAnchor.constraint(equalTo: cardContent.topAnchor, constant: 14),
-                cardStack.leadingAnchor.constraint(equalTo: cardContent.leadingAnchor, constant: 16),
-                cardStack.trailingAnchor.constraint(equalTo: cardContent.trailingAnchor, constant: -16),
-                cardStack.bottomAnchor.constraint(equalTo: cardContent.bottomAnchor, constant: -14),
-            ])
-        }
-
-        NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: container.topAnchor),
-            header.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 4),
-            card.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 6),
-            card.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            card.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            card.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            container.widthAnchor.constraint(equalToConstant: SettingsLayoutSupport.windowWidth - 40),
-        ])
-
-        // Check login status in background
-        refreshHFAccountStatus()
-
-        return container
-    }
-
-    private func refreshHFAccountStatus() {
-        let config = configManager.loadConfig()
-        let pythonPath = config.localModelPythonPath.isEmpty
-            ? localModelsPythonPathField.stringValue : config.localModelPythonPath
-        guard !pythonPath.isEmpty else {
-            hfAccountStatusDot.textColor = .systemOrange
-            hfAccountStatusLabel.stringValue = "Set Python path first"
-            hfAccountDetailLabel.stringValue = ""
-            hfAccountLogoutBtn.isHidden = true
-            return
-        }
-
-        let runner = self.localModelRunner ?? LocalModelRunner()
-        Task.detached {
-            do {
-                let result = try runner.checkHFLogin(pythonPath: pythonPath)
-                await MainActor.run { [weak self] in
-                    guard let self else { return }
-                    if result.loggedIn {
-                        self.hfAccountStatusDot.textColor = .systemGreen
-                        self.hfAccountStatusLabel.stringValue = "Logged in as: \(result.username)"
-                        self.hfAccountLogoutBtn.isHidden = false
-                        let sourceDesc = result.tokenSource == "env" ? "HF_TOKEN env var" : "~/.huggingface/token"
-                        self.hfAccountDetailLabel.stringValue = "Token source: \(sourceDesc)"
-                    } else {
-                        self.hfAccountStatusDot.textColor = .systemRed
-                        self.hfAccountStatusLabel.stringValue = "Not logged in"
-                        self.hfAccountLogoutBtn.isHidden = true
-                        self.hfAccountDetailLabel.stringValue = ""
-                    }
-                }
-            } catch {
-                await MainActor.run { [weak self] in
-                    self?.hfAccountStatusDot.textColor = .systemOrange
-                    self?.hfAccountStatusLabel.stringValue = "Could not check login"
-                    self?.hfAccountDetailLabel.stringValue = ""
-                    self?.hfAccountLogoutBtn.isHidden = true
-                }
-            }
-        }
-    }
-
-    @objc private func hfSaveTokenClicked(_ sender: NSButton) {
-        let token = hfAccountTokenField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !token.isEmpty else { return }
-
-        let config = configManager.loadConfig()
-        let pythonPath = config.localModelPythonPath.isEmpty
-            ? localModelsPythonPathField.stringValue : config.localModelPythonPath
-        guard !pythonPath.isEmpty else {
-            let alert = NSAlert()
-            alert.messageText = "Python Path Required"
-            alert.informativeText = "Please set a Python path in the Python Environment section above."
-            alert.runModal()
-            return
-        }
-
-        sender.isEnabled = false
-        sender.title = "Saving..."
-        let runner = self.localModelRunner ?? LocalModelRunner()
-        Task.detached {
-            do {
-                let username = try runner.saveHFToken(token: token, pythonPath: pythonPath)
-                await MainActor.run { [weak self] in
-                    sender.isEnabled = true
-                    sender.title = "Save Token"
-                    self?.hfAccountTokenField.stringValue = ""
-                    self?.hfAccountStatusDot.textColor = .systemGreen
-                    self?.hfAccountStatusLabel.stringValue = "Logged in as: \(username)"
-                    self?.hfAccountLogoutBtn.isHidden = false
-                    self?.hfAccountDetailLabel.stringValue = "Token source: ~/.huggingface/token"
-                }
-            } catch {
-                await MainActor.run {
-                    sender.isEnabled = true
-                    sender.title = "Save Token"
-                    let alert = NSAlert()
-                    alert.messageText = "Token Validation Failed"
-                    alert.informativeText = error.localizedDescription
-                    alert.runModal()
-                }
-            }
-        }
-    }
-
-    @objc private func hfLogoutClicked(_ sender: NSButton) {
-        let config = configManager.loadConfig()
-        let pythonPath = config.localModelPythonPath.isEmpty
-            ? localModelsPythonPathField.stringValue : config.localModelPythonPath
-
-        let runner = self.localModelRunner ?? LocalModelRunner()
-        Task.detached {
-            try? runner.logoutHF(pythonPath: pythonPath)
-            await MainActor.run { [weak self] in
-                self?.hfAccountStatusDot.textColor = .systemRed
-                self?.hfAccountStatusLabel.stringValue = "Not logged in"
-                self?.hfAccountLogoutBtn.isHidden = true
-                self?.hfAccountDetailLabel.stringValue = ""
-            }
-        }
-    }
-
-    private func buildLocalModelsHardwareSection() -> NSView {
-        let container = NSView()
-        container.translatesAutoresizingMaskIntoConstraints = false
-
-        let header = NSTextField(labelWithString: "HARDWARE")
-        header.font = .systemFont(ofSize: 11, weight: .medium)
-        header.textColor = .secondaryLabelColor
-        header.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(header)
-
-        let card = NSBox()
-        card.boxType = .custom
-        card.cornerRadius = SettingsLayoutSupport.groupCornerRadius
-        card.fillColor = .controlBackgroundColor
-        card.borderColor = .separatorColor
-        card.borderWidth = 0.5
-        card.contentViewMargins = .zero
-        card.titlePosition = .noTitle
-        card.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(card)
-
-        let cardStack = NSStackView()
-        cardStack.orientation = .vertical
-        cardStack.spacing = 6
-        cardStack.translatesAutoresizingMaskIntoConstraints = false
-
-        let hw = LocalModelRunner().gatherHardwareInfo()
-        let ramGB = String(format: "%.1f", Double(hw.totalRAMBytes) / 1_073_741_824.0)
-        let diskGB = String(format: "%.1f", Double(hw.availableDiskBytes) / 1_073_741_824.0)
-
-        let ramLabel = NSTextField(labelWithString: "RAM: \(ramGB) GB total")
-        ramLabel.font = .systemFont(ofSize: 12)
-        cardStack.addArrangedSubview(ramLabel)
-
-        let diskLabel = NSTextField(labelWithString: "Disk: \(diskGB) GB available")
-        diskLabel.font = .systemFont(ofSize: 12)
-        cardStack.addArrangedSubview(diskLabel)
-
-        let archLabel = NSTextField(labelWithString: "Architecture: \(hw.architecture == "arm64" ? "Apple Silicon" : hw.architecture)")
-        archLabel.font = .systemFont(ofSize: 12)
-        cardStack.addArrangedSubview(archLabel)
-
-        if let cardContent = card.contentView {
-            cardContent.addSubview(cardStack)
-            NSLayoutConstraint.activate([
-                cardStack.topAnchor.constraint(equalTo: cardContent.topAnchor, constant: 14),
-                cardStack.leadingAnchor.constraint(equalTo: cardContent.leadingAnchor, constant: 16),
-                cardStack.trailingAnchor.constraint(equalTo: cardContent.trailingAnchor, constant: -16),
-                cardStack.bottomAnchor.constraint(equalTo: cardContent.bottomAnchor, constant: -14),
-            ])
-        }
-
-        NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: container.topAnchor),
-            header.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 4),
-            card.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 6),
-            card.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            card.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            card.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            container.widthAnchor.constraint(equalToConstant: SettingsLayoutSupport.windowWidth - 40),
-        ])
-
-        return container
-    }
-
-    private func refreshModelRows(config: AppConfig) {
-        localModelsModelRows.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        let promptOverrides = LocalModelSupport.promptTemplateOverrides(from: config)
-
-        // Determine which models are actually downloaded
-        var downloadedSet = Set<String>()
-        for model in LocalModelSupport.recommendedModels {
-            let modelDir = LocalModelSupport.modelDirectoryURL(
-                baseDirectoryURL: configManager.baseDirectoryURL, repoID: model.repoID
-            )
-            if FileManager.default.fileExists(atPath: modelDir.path) {
-                downloadedSet.insert(model.repoID)
-            }
-        }
-
-        // Parse custom models
-        var savedCustom: [LocalModelEntry] = []
-        if let data = config.localModelCustomModels.data(using: .utf8),
-           let decoded = try? JSONDecoder().decode([LocalModelEntry].self, from: data) {
-            savedCustom = decoded
-            for custom in savedCustom {
-                let dir = LocalModelSupport.modelDirectoryURL(
-                    baseDirectoryURL: configManager.baseDirectoryURL, repoID: custom.repoID
-                )
-                if FileManager.default.fileExists(atPath: dir.path) {
-                    downloadedSet.insert(custom.repoID)
-                }
-            }
-        }
-
-        let merged = LocalModelSupport.mergedModelList(saved: savedCustom, downloaded: downloadedSet)
-        let recommendedRepoIDs = Set(LocalModelSupport.recommendedModels.map(\.repoID))
-
-        for entry in merged {
-            let isActive = entry.repoID == config.localModelRepoID
-            let isCustom = !recommendedRepoIDs.contains(entry.repoID)
-            let isPromptOverridden = promptOverrides[entry.repoID].map(LocalModelSupport.validatePromptTemplate) ?? false
-            let row = makeModelRow(
-                name: entry.displayName, params: entry.parameterCount,
-                disk: String(format: "%.1f GB", entry.approxDiskGB),
-                status: entry.status == .ready ? "Ready" : "Not downloaded",
-                repoID: entry.repoID, isActive: isActive,
-                isCustom: isCustom, isPromptOverridden: isPromptOverridden
-            )
-            localModelsModelRows.addArrangedSubview(row)
-        }
-    }
-
-    private func makeModelRow(
-        name: String, params: String, disk: String, status: String,
-        repoID: String, isActive: Bool, isCustom: Bool = false, isPromptOverridden: Bool = false
-    ) -> NSView {
-        let card = NSBox()
-        card.boxType = .custom
-        card.cornerRadius = 8
-        card.borderWidth = 0.5
-        card.borderColor = .separatorColor
-        card.fillColor = NSColor.controlBackgroundColor.withAlphaComponent(0.55)
-        card.titlePosition = .noTitle
-        card.contentViewMargins = NSSize(width: 10, height: 8)
-        card.translatesAutoresizingMaskIntoConstraints = false
-
-        let container = NSStackView()
-        container.orientation = .vertical
-        container.spacing = 8
-        container.alignment = .leading
-        container.translatesAutoresizingMaskIntoConstraints = false
-
-        let topRow = NSStackView()
-        topRow.orientation = .horizontal
-        topRow.spacing = 8
-        topRow.alignment = .centerY
-
-        let nameLabel = NSTextField(labelWithString: name)
-        nameLabel.font = .systemFont(ofSize: 13, weight: .semibold)
-        nameLabel.lineBreakMode = .byTruncatingTail
-        nameLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        nameLabel.translatesAutoresizingMaskIntoConstraints = false
-        nameLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 180).isActive = true
-
-        let metaStack = NSStackView()
-        metaStack.orientation = .horizontal
-        metaStack.spacing = 8
-        metaStack.alignment = .centerY
-        metaStack.setContentHuggingPriority(.required, for: .horizontal)
-
-        let paramsDisplay = (params == "?" || params.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) ? "Unknown params" : params
-        let diskIsUnknown = disk.hasPrefix("0.0") || disk.hasPrefix("-")
-        let diskDisplay = diskIsUnknown ? "Unknown size" : disk
-        let paramsLabel = NSTextField(labelWithString: paramsDisplay)
-        paramsLabel.font = .systemFont(ofSize: 11)
-        paramsLabel.textColor = .secondaryLabelColor
-        let diskLabel = NSTextField(labelWithString: diskDisplay)
-        diskLabel.font = .systemFont(ofSize: 11)
-        diskLabel.textColor = .secondaryLabelColor
-        let statusLabel = NSTextField(labelWithString: status)
-        statusLabel.font = .systemFont(ofSize: 11, weight: .semibold)
-        statusLabel.textColor = status == "Ready" ? .systemGreen : .secondaryLabelColor
-        statusLabel.setContentHuggingPriority(.required, for: .horizontal)
-
-        metaStack.addArrangedSubview(paramsLabel)
-        metaStack.addArrangedSubview(separatorDotLabel())
-        metaStack.addArrangedSubview(diskLabel)
-        metaStack.addArrangedSubview(separatorDotLabel())
-        metaStack.addArrangedSubview(statusLabel)
-
-        if isPromptOverridden {
-            metaStack.addArrangedSubview(separatorDotLabel())
-            let promptBadge = NSTextField(labelWithString: "Custom Prompt")
-            promptBadge.font = .systemFont(ofSize: 11, weight: .medium)
-            promptBadge.textColor = .systemBlue
-            metaStack.addArrangedSubview(promptBadge)
-        }
-
-        topRow.addArrangedSubview(nameLabel)
-        topRow.addArrangedSubview(metaStack)
-        container.addArrangedSubview(topRow)
-
-        let actionsRow = NSStackView()
-        actionsRow.orientation = .horizontal
-        actionsRow.spacing = 8
-        actionsRow.alignment = .centerY
-
-        let promptBtn = NSButton(title: "Prompt", target: self, action: #selector(editModelPromptClicked(_:)))
-        promptBtn.bezelStyle = .rounded
-        promptBtn.font = .systemFont(ofSize: 10)
-        promptBtn.identifier = NSUserInterfaceItemIdentifier(repoID)
-        actionsRow.addArrangedSubview(promptBtn)
-
-        if status == "Ready" {
-            let selectBtn = NSButton(
-                checkboxWithTitle: isActive ? "Active" : "Select",
-                target: self, action: #selector(selectModelClicked(_:))
-            )
-            selectBtn.state = isActive ? .on : .off
-            selectBtn.identifier = NSUserInterfaceItemIdentifier(repoID)
-            selectBtn.font = .systemFont(ofSize: 10)
-            actionsRow.addArrangedSubview(selectBtn)
-
-            let deleteBtn = NSButton(title: "Delete", target: self, action: #selector(deleteModelClicked(_:)))
-            deleteBtn.bezelStyle = .rounded
-            deleteBtn.font = .systemFont(ofSize: 10)
-            deleteBtn.identifier = NSUserInterfaceItemIdentifier(repoID)
-            actionsRow.addArrangedSubview(deleteBtn)
-        } else {
-            let pullBtn = NSButton(title: "Pull", target: self, action: #selector(pullModelClicked(_:)))
-            pullBtn.bezelStyle = .rounded
-            pullBtn.font = .systemFont(ofSize: 10)
-            pullBtn.identifier = NSUserInterfaceItemIdentifier(repoID)
-            actionsRow.addArrangedSubview(pullBtn)
-
-            // Custom models also get a Delete (remove) button when not downloaded
-            if isCustom {
-                let removeBtn = NSButton(title: "Delete", target: self, action: #selector(deleteModelClicked(_:)))
-                removeBtn.bezelStyle = .rounded
-                removeBtn.font = .systemFont(ofSize: 10)
-                removeBtn.identifier = NSUserInterfaceItemIdentifier(repoID)
-                actionsRow.addArrangedSubview(removeBtn)
-            }
-        }
-        actionsRow.setContentHuggingPriority(.required, for: .vertical)
-        container.addArrangedSubview(actionsRow)
-
-        card.contentView?.addSubview(container)
-        if let content = card.contentView {
-            NSLayoutConstraint.activate([
-                container.topAnchor.constraint(equalTo: content.topAnchor),
-                container.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-                container.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-                container.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            ])
-        }
-
-        return card
-    }
-
-    private func separatorDotLabel() -> NSTextField {
-        let dot = NSTextField(labelWithString: "•")
-        dot.font = .systemFont(ofSize: 10)
-        dot.textColor = .tertiaryLabelColor
-        dot.setContentHuggingPriority(.required, for: .horizontal)
-        return dot
-    }
-
-    @objc private func installPythonPackagesClicked(_ sender: NSButton) {
-        let pythonPath = localModelsPythonPathField.stringValue
-        let cmd = PythonEnvironmentSupport.pipInstallCommand(pythonPath: pythonPath)
-        sender.isEnabled = false
-        localModelsStatusLabel.stringValue = "Installing packages..."
-        localModelsStatusDot.textColor = .systemGray
-        Task.detached { [weak self] in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/bash")
-            process.arguments = ["-c", cmd]
-            let errPipe = Pipe()
-            process.standardError = errPipe
-            try? process.run()
-            process.waitUntilExit()
-            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-            let errStr = String(data: errData, encoding: .utf8) ?? ""
-            await MainActor.run {
-                sender.isEnabled = true
-                if process.terminationStatus == 0 {
-                    self?.localModelsStatusDot.textColor = .systemGreen
-                    self?.localModelsStatusLabel.stringValue = "Packages installed successfully"
-                    // Re-check status after install
-                    self?.refreshPythonStatus()
-                } else {
-                    self?.localModelsStatusDot.textColor = .systemRed
-                    // Show the last meaningful line of pip output
-                    let lastLine = errStr.components(separatedBy: .newlines)
-                        .map { $0.trimmingCharacters(in: .whitespaces) }
-                        .last(where: { !$0.isEmpty && !$0.hasPrefix("[notice]") }) ?? ""
-                    if lastLine.isEmpty {
-                        self?.localModelsStatusLabel.stringValue = "Package installation failed (exit \(process.terminationStatus))"
-                    } else {
-                        self?.localModelsStatusLabel.stringValue = "Install failed: \(lastLine)"
-                    }
-                }
-            }
-        }
-    }
-
-    @objc private func pullModelClicked(_ sender: NSButton) {
-        guard let repoID = sender.identifier?.rawValue, !repoID.isEmpty else { return }
-        let config = configManager.loadConfig()
-        let destPath = LocalModelSupport.modelDirectoryURL(
-            baseDirectoryURL: configManager.baseDirectoryURL, repoID: repoID
-        ).path
-        let pythonPath = config.localModelPythonPath.isEmpty
-            ? localModelsPythonPathField.stringValue : config.localModelPythonPath
-        sender.isEnabled = false
-        sender.title = "Pulling..."
-
-        let runner = self.localModelRunner ?? LocalModelRunner()
-        Task.detached {
-            do {
-                try runner.downloadModel(
-                    repoID: repoID, destPath: destPath, pythonPath: pythonPath,
-                    onProgress: { line in
-                        if let data = line.data(using: .utf8),
-                           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                           let message = json["message"] as? String {
-                            DispatchQueue.main.async { sender.title = message }
-                        }
-                    }
-                )
-                await MainActor.run { [weak self] in
-                    sender.title = "Done"
-                    if let self { self.refreshModelRows(config: self.configManager.loadConfig()) }
-                }
-            } catch {
-                await MainActor.run {
-                    sender.isEnabled = true
-                    sender.title = "Pull"
-                    let errMsg = error.localizedDescription
-                    let isGatedAccessError = errMsg.lowercased().contains("gated repo")
-                        || errMsg.lowercased().contains("access to model")
-                        || errMsg.contains("403")
-                    let isNoTokenError = errMsg.contains("401")
-                        || errMsg.lowercased().contains("authorization")
-                    let alert = NSAlert()
-                    if isGatedAccessError {
-                        alert.messageText = "Model Access Required"
-                        alert.informativeText = "This model is gated and requires you to accept the license on HuggingFace.\n\n1. Visit the model page (link in the error below)\n2. Click \"Agree and access repository\"\n3. Wait for approval, then try Pull again\n\n\(errMsg)"
-                    } else if isNoTokenError {
-                        alert.messageText = "Authentication Required"
-                        alert.informativeText = "This model requires HuggingFace authentication. Please add your token in the Hugging Face Account section below.\n\nOriginal error: \(errMsg)"
-                    } else {
-                        alert.messageText = "Download Failed"
-                        alert.informativeText = errMsg
-                    }
-                    alert.runModal()
-                }
-            }
-        }
-    }
-
-    @objc private func selectModelClicked(_ sender: NSButton) {
-        guard let repoID = sender.identifier?.rawValue else { return }
-        var config = configManager.loadConfig()
-        config.localModelRepoID = sender.state == .on ? repoID : ""
-        try? configManager.saveConfig(config)
-        onConfigSaved(config)
-        refreshModelRows(config: config)
-    }
-
-    @objc private func deleteModelClicked(_ sender: NSButton) {
-        guard let repoID = sender.identifier?.rawValue else { return }
-
-        // Delete model files if they exist
-        let modelDir = LocalModelSupport.modelDirectoryURL(
-            baseDirectoryURL: configManager.baseDirectoryURL, repoID: repoID
-        )
-        try? FileManager.default.removeItem(at: modelDir)
-
-        var config = configManager.loadConfig()
-
-        // Remove from custom models list if present
-        if let data = config.localModelCustomModels.data(using: .utf8),
-           var customModels = try? JSONDecoder().decode([LocalModelEntry].self, from: data) {
-            let countBefore = customModels.count
-            customModels.removeAll { $0.repoID == repoID }
-            if customModels.count != countBefore {
-                if let encoded = try? JSONEncoder().encode(customModels),
-                   let jsonStr = String(data: encoded, encoding: .utf8) {
-                    config.localModelCustomModels = jsonStr
-                }
-            }
-        }
-
-        // Clear active if it was selected
-        if config.localModelRepoID == repoID {
-            config.localModelRepoID = ""
-        }
-        try? configManager.saveConfig(config)
-        onConfigSaved(config)
-        refreshModelRows(config: configManager.loadConfig())
-    }
-
-    @objc private func addCustomModelClicked(_ sender: NSButton) {
-        guard let parentStack = sender.superview as? NSStackView else { return }
-        let customField = parentStack.arrangedSubviews.first(where: { $0.tag == 9990 }) as? NSTextField
-        guard let input = customField?.stringValue, !input.isEmpty else { return }
-        guard let repoID = LocalModelSupport.extractRepoID(from: input) else {
-            let alert = NSAlert()
-            alert.messageText = "Invalid Model"
-            alert.informativeText = "Enter a valid Hugging Face repo ID (org/model) or URL."
-            alert.runModal()
-            return
-        }
-
-        var config = configManager.loadConfig()
-        var customModels: [LocalModelEntry] = []
-        if let data = config.localModelCustomModels.data(using: .utf8) {
-            customModels = (try? JSONDecoder().decode([LocalModelEntry].self, from: data)) ?? []
-        }
-        guard !customModels.contains(where: { $0.repoID == repoID }) else { return }
-
-        let entry = LocalModelEntry(
-            repoID: repoID,
-            displayName: repoID.components(separatedBy: "/").last ?? repoID,
-            parameterCount: "Unknown params",
-            approxDiskGB: -1
-        )
-        customModels.append(entry)
-        if let encoded = try? JSONEncoder().encode(customModels),
-           let jsonStr = String(data: encoded, encoding: .utf8) {
-            config.localModelCustomModels = jsonStr
-            try? configManager.saveConfig(config)
-        }
-        customField?.stringValue = ""
-        refreshModelRows(config: configManager.loadConfig())
-    }
-
-    @objc private func editModelPromptClicked(_ sender: NSButton) {
-        guard let repoID = sender.identifier?.rawValue else { return }
-        let config = configManager.loadConfig()
-        let current = LocalModelSupport.resolvedPromptTemplate(for: repoID, config: config)
-        let defaultTemplate = LocalModelSupport.defaultPromptTemplate(for: repoID)
-
-        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 540, height: 200))
-        scrollView.hasVerticalScroller = true
-        scrollView.borderType = .bezelBorder
-
-        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 540, height: 200))
-        textView.isRichText = false
-        textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        textView.string = current
-        scrollView.documentView = textView
-
-        let alert = NSAlert()
-        alert.alertStyle = .informational
-        alert.messageText = "Edit Prompt Template"
-        alert.informativeText = "Model: \(repoID)\nTemplate must include {text}. Return corrected text only."
-        alert.accessoryView = scrollView
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Reset Default")
-        alert.addButton(withTitle: "Cancel")
-
-        let response = alert.runModal()
-        if response == .alertFirstButtonReturn {
-            let edited = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard LocalModelSupport.validatePromptTemplate(edited) else {
-                let validationAlert = NSAlert()
-                validationAlert.alertStyle = .warning
-                validationAlert.messageText = "Invalid Prompt Template"
-                validationAlert.informativeText = "The template must be non-empty and include {text}."
-                validationAlert.runModal()
-                return
-            }
-            savePromptTemplateOverride(edited, for: repoID)
-            return
-        }
-
-        if response == .alertSecondButtonReturn {
-            savePromptTemplateOverride(defaultTemplate, for: repoID, removeOverrideWhenMatchingDefault: true)
-        }
-    }
-
-    private func savePromptTemplateOverride(
-        _ template: String,
-        for repoID: String,
-        removeOverrideWhenMatchingDefault: Bool = false
-    ) {
-        var config = configManager.loadConfig()
-        var overrides = LocalModelSupport.promptTemplateOverrides(from: config)
-
-        if removeOverrideWhenMatchingDefault,
-           template == LocalModelSupport.defaultPromptTemplate(for: repoID) {
-            overrides.removeValue(forKey: repoID)
-        } else {
-            overrides[repoID] = template
-        }
-
-        guard let encoded = try? JSONEncoder().encode(overrides),
-              let encodedString = String(data: encoded, encoding: .utf8) else {
-            return
-        }
-
-        config.localModelPromptTemplates = encodedString
-        try? configManager.saveConfig(config)
-        onConfigSaved(config)
-        refreshModelRows(config: config)
-    }
-
-    @objc private func testInferenceClicked(_ sender: NSButton) {
-        let config = configManager.loadConfig()
-        guard !config.localModelRepoID.isEmpty else {
-            let alert = NSAlert()
-            alert.messageText = "No Model Selected"
-            alert.informativeText = "Select a downloaded model first."
-            alert.runModal()
-            return
-        }
-        let modelPath = LocalModelSupport.modelDirectoryURL(
-            baseDirectoryURL: configManager.baseDirectoryURL, repoID: config.localModelRepoID
-        ).path
-        let pythonPath = config.localModelPythonPath.isEmpty
-            ? localModelsPythonPathField.stringValue : config.localModelPythonPath
-        sender.isEnabled = false
-        sender.title = "Testing..."
-        let runner = localModelRunner
-        Task.detached {
-            do {
-                let result = try runner?.correctText(
-                    "She go to the store yesterday and buyed some food.",
-                    modelPath: modelPath,
-                    pythonPath: pythonPath,
-                    timeoutSeconds: 120,
-                    promptTemplate: LocalModelSupport.resolvedPromptTemplate(for: config.localModelRepoID, config: config)
-                ) ?? ""
-                await MainActor.run {
-                    sender.isEnabled = true
-                    sender.title = "Test Inference"
-                    let alert = NSAlert()
-                    alert.messageText = "Test Result"
-                    alert.informativeText = result
-                    alert.runModal()
-                }
-            } catch {
-                await MainActor.run {
-                    sender.isEnabled = true
-                    sender.title = "Test Inference"
-                    let alert = NSAlert()
-                    alert.messageText = "Test Failed"
-                    alert.informativeText = error.localizedDescription
-                    alert.runModal()
-                }
-            }
-        }
-    }
-
     private func buildCorrectionModesSection() -> NSView {
-        let container = NSView()
-        container.translatesAutoresizingMaskIntoConstraints = false
-
-        // Section header
-        let header = NSTextField(labelWithString: "CORRECTION MODES")
-        header.font = .systemFont(ofSize: 11, weight: .medium)
-        header.textColor = .secondaryLabelColor
-        header.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(header)
-
-        let card = NSBox()
-        card.boxType = .custom
-        card.cornerRadius = SettingsLayoutSupport.groupCornerRadius
-        card.fillColor = .controlBackgroundColor
-        card.borderColor = .separatorColor
-        card.borderWidth = 0.5
-        card.contentViewMargins = .zero
-        card.titlePosition = .noTitle
-        card.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(card)
-
-        // Build comparison table
-        let tableStack = NSStackView()
-        tableStack.orientation = .vertical
-        tableStack.spacing = 0
-        tableStack.translatesAutoresizingMaskIntoConstraints = false
-
-        let colWidths: (feature: CGFloat, local: CGFloat, llm: CGFloat) = (80, 145, 170)
-
-        // Detect local model configuration
-        let config = configManager.loadConfig()
-        let hasLocalModel = !config.localModelRepoID.isEmpty
-
-        // Dynamic hotkey labels from config
-        let baseHotkey = HotkeySupport.symbolString(keyCode: config.hotkeyKeyCode, modifiers: config.hotkeyModifiers)
-        let shiftHotkey = HotkeySupport.symbolString(keyCode: config.cloudHotkeyKeyCode, modifiers: config.cloudHotkeyModifiers)
-
-        // Header row
-        let headerRow = makeComparisonRow(
-            feature: "Feature", local: "\(baseHotkey) Local", llm: "\(shiftHotkey) LLM",
-            widths: colWidths, isHeader: true
-        )
-        tableStack.addArrangedSubview(headerRow)
-
-        // Data rows
-        let rows: [(String, String, String)] = [
-            ("Speed", hasLocalModel ? "2\u{2013}10 seconds" : "Instant", "Depends on model"),
-            ("Network", "None (offline)", "Local Ollama or cloud"),
-            ("Spelling", "Yes", "Yes"),
-            ("Grammar",
-             hasLocalModel ? "Yes (Model + Harper)" : "Yes (Harper)",
-             "Yes (contextual)"),
-            ("Punctuation",
-             hasLocalModel ? "Yes (Model)" : "Basic (Dictionary)",
-             "Yes"),
-            ("Rewrites", hasLocalModel ? "Light corrections" : "No", "Full restructuring"),
-        ]
-
-        for (index, row) in rows.enumerated() {
-            let rowView = makeComparisonRow(
-                feature: row.0, local: row.1, llm: row.2,
-                widths: colWidths, isHeader: false
-            )
-            if index % 2 == 0 {
-                let bg = NSView()
-                bg.wantsLayer = true
-                bg.layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.08).cgColor
-                bg.translatesAutoresizingMaskIntoConstraints = false
-                rowView.addSubview(bg, positioned: .below, relativeTo: nil)
-                NSLayoutConstraint.activate([
-                    bg.topAnchor.constraint(equalTo: rowView.topAnchor),
-                    bg.leadingAnchor.constraint(equalTo: rowView.leadingAnchor),
-                    bg.trailingAnchor.constraint(equalTo: rowView.trailingAnchor),
-                    bg.bottomAnchor.constraint(equalTo: rowView.bottomAnchor),
-                ])
-            }
-            tableStack.addArrangedSubview(rowView)
-        }
-
-        // Engine status
-        let engineStack = NSStackView()
-        engineStack.orientation = .horizontal
-        engineStack.spacing = 6
-        engineStack.alignment = .firstBaseline
-        engineStack.translatesAutoresizingMaskIntoConstraints = false
-
-        let dotView = NSTextField(labelWithString: "\u{25CF}")
-        dotView.font = .systemFont(ofSize: 10)
-
-        let engineLabel = NSTextField(labelWithString: "")
-        engineLabel.font = .systemFont(ofSize: 11)
-        engineLabel.textColor = .secondaryLabelColor
-        engineLabel.lineBreakMode = .byWordWrapping
-        engineLabel.maximumNumberOfLines = 2
-        engineLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        if hasLocalModel {
-            let modelName = configManager.loadConfig().localModelRepoID
-            dotView.textColor = .systemGreen
-            engineLabel.stringValue = "Local engine: \(modelName) (Hugging Face)"
-        } else {
-            dotView.textColor = .systemOrange
-            engineLabel.stringValue = "Local engine: Harper + NSSpellChecker (no local model) - configure in Settings > Local Models"
-        }
-
-        engineStack.addArrangedSubview(dotView)
-        engineStack.addArrangedSubview(engineLabel)
-
-        // Assemble card content
-        let cardStack = NSStackView()
-        cardStack.orientation = .vertical
-        cardStack.spacing = 12
-        cardStack.translatesAutoresizingMaskIntoConstraints = false
-        cardStack.addArrangedSubview(tableStack)
-        cardStack.addArrangedSubview(engineStack)
-
-        if let cardContent = card.contentView {
-            cardContent.addSubview(cardStack)
-            NSLayoutConstraint.activate([
-                cardStack.topAnchor.constraint(equalTo: cardContent.topAnchor, constant: 14),
-                cardStack.leadingAnchor.constraint(equalTo: cardContent.leadingAnchor, constant: 16),
-                cardStack.trailingAnchor.constraint(equalTo: cardContent.trailingAnchor, constant: -16),
-                cardStack.bottomAnchor.constraint(equalTo: cardContent.bottomAnchor, constant: -14),
-            ])
-        }
-
-        NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: container.topAnchor),
-            header.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 4),
-            header.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor),
-
-            card.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 6),
-            card.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            card.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            card.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-        ])
-
-        return container
-    }
-
-    private func makeComparisonRow(
-        feature: String, local: String, llm: String,
-        widths: (feature: CGFloat, local: CGFloat, llm: CGFloat),
-        isHeader: Bool
-    ) -> NSView {
-        let row = NSStackView()
-        row.orientation = .horizontal
-        row.spacing = 0
-        row.distribution = .fill
-        row.translatesAutoresizingMaskIntoConstraints = false
-
-        let font: NSFont = isHeader
-            ? .systemFont(ofSize: 11, weight: .semibold)
-            : .systemFont(ofSize: 11)
-        let color: NSColor = isHeader ? .secondaryLabelColor : .labelColor
-
-        func makeCell(_ text: String, width: CGFloat) -> NSTextField {
-            let label = NSTextField(labelWithString: text)
-            label.font = font
-            label.textColor = color
-            label.lineBreakMode = .byTruncatingTail
-            label.translatesAutoresizingMaskIntoConstraints = false
-            label.widthAnchor.constraint(equalToConstant: width).isActive = true
-            return label
-        }
-
-        let featureCell = makeCell(feature, width: widths.feature)
-        let localCell = makeCell(local, width: widths.local)
-        let llmCell = makeCell(llm, width: widths.llm)
-
-        row.addArrangedSubview(featureCell)
-        row.addArrangedSubview(localCell)
-        row.addArrangedSubview(llmCell)
-
-        // Vertical padding
-        let padding: CGFloat = isHeader ? 6 : 4
-        row.edgeInsets = NSEdgeInsets(top: padding, left: 0, bottom: padding, right: 0)
-
-        return row
+        let note = makeDescription("The correction hotkey shows a nearby diff and a Copy button. It does not replace the selected text.")
+        note.maximumNumberOfLines = 3
+        return makeSection(title: "Correction", views: [note])
     }
 
     private func buildGeneralTab() -> NSView {
@@ -1523,15 +243,32 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         customModelContainer.addArrangedSubview(makeFieldLabel("Custom"))
         customModelContainer.addArrangedSubview(customModelField)
 
+        configureServerURLField(ollamaURLField)
+        configureServerURLField(magpieURLField)
         ollamaURLField.placeholderString = AppConfig.default.ollamaBaseURL
+        magpieURLField.placeholderString = AppConfig.default.magpieBaseURL
         ollamaURLField.toolTip = "Ollama server URL. Localhost keeps corrections on this Mac."
-        refreshOllamaModelsButton.target = self
-        refreshOllamaModelsButton.action = #selector(refreshOllamaModelsClicked)
-        ollamaSettingsContainer.orientation = .vertical
-        ollamaSettingsContainer.alignment = .leading
-        ollamaSettingsContainer.spacing = 8
-        ollamaSettingsContainer.addArrangedSubview(makeRow(label: makeFieldLabel("Server URL"), field: ollamaURLField))
-        ollamaSettingsContainer.addArrangedSubview(refreshOllamaModelsButton)
+        magpieURLField.toolTip = "Magpie gateway URL. The local gateway must be running."
+        refreshModelsButton.target = self
+        refreshModelsButton.action = #selector(refreshModelsClicked)
+        refreshModelsButton.lineBreakMode = .byClipping
+        refreshModelsButton.setContentHuggingPriority(.required, for: .horizontal)
+        refreshModelsButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+        serverURLContainer.orientation = .vertical
+        serverURLContainer.alignment = .leading
+        serverURLContainer.spacing = 8
+        serverURLContainer.addArrangedSubview(makeRow(label: makeFieldLabel("Server URL"), field: ollamaURLField))
+        serverURLContainer.addArrangedSubview(makeRow(label: makeFieldLabel("Server URL"), field: magpieURLField))
+
+        let modelRow = NSStackView()
+        modelRow.orientation = .horizontal
+        modelRow.alignment = .firstBaseline
+        modelRow.spacing = 8
+        modelRow.addArrangedSubview(makeFieldLabel("Model"))
+        modelPopup.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        modelPopup.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        modelRow.addArrangedSubview(modelPopup)
+        modelRow.addArrangedSubview(refreshModelsButton)
 
         languagePopup.removeAllItems()
         AppConfig.supportedLanguages.forEach { languagePopup.addItem(withTitle: $0.displayName) }
@@ -1547,7 +284,7 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         let modelDesc = makeDescription(modelDescriptionText())
         modelDesc.identifier = NSUserInterfaceItemIdentifier("modelDescriptionLabel")
 
-        let languageDesc = makeDescription("Auto-detect works for most languages")
+        let languageDesc = makeDescription("Auto-detect keeps the input language. A chosen language translates into it when needed.")
         let toneDesc = makeDescription("Adjusts formality and style of corrections")
 
         let stack = makeTabStack(sections: [
@@ -1555,8 +292,8 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
             makeSection(title: "Provider & Model", views: [
                 makeRow(label: makeFieldLabel("Provider"), field: providerPopup),
                 providerDesc,
-                ollamaSettingsContainer,
-                makeRow(label: makeFieldLabel("Model"), field: modelPopup),
+                serverURLContainer,
+                modelRow,
                 modelDesc,
                 customModelContainer,
                 hintLabel,
@@ -1606,7 +343,7 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
     }
 
     private func buildHotkeyTab() -> NSView {
-        // Local hotkey controls
+        // Correction hotkey controls
         hotkeyKeyPopup.removeAllItems()
         hotkeyKeyOptions.forEach { hotkeyKeyPopup.addItem(withTitle: $0.title) }
         hotkeyKeyPopup.target = self
@@ -1659,71 +396,12 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         badgeRow.addArrangedSubview(makeFieldLabel("Current"))
         badgeRow.addArrangedSubview(hotkeyBadgeView)
 
-        // Cloud hotkey controls
-        cloudHotkeyKeyPopup.removeAllItems()
-        hotkeyKeyOptions.forEach { cloudHotkeyKeyPopup.addItem(withTitle: $0.title) }
-        cloudHotkeyKeyPopup.target = self
-        cloudHotkeyKeyPopup.action = #selector(cloudHotkeyInputChanged)
-
-        cloudCommandModifierCheckbox.target = self
-        cloudCommandModifierCheckbox.action = #selector(cloudHotkeyInputChanged)
-        cloudOptionModifierCheckbox.target = self
-        cloudOptionModifierCheckbox.action = #selector(cloudHotkeyInputChanged)
-        cloudControlModifierCheckbox.target = self
-        cloudControlModifierCheckbox.action = #selector(cloudHotkeyInputChanged)
-        cloudShiftModifierCheckbox.target = self
-        cloudShiftModifierCheckbox.action = #selector(cloudHotkeyInputChanged)
-
-        let cloudModStack = NSStackView()
-        cloudModStack.orientation = .horizontal
-        cloudModStack.spacing = 6
-        cloudModStack.addArrangedSubview(cloudCommandModifierCheckbox)
-        cloudModStack.addArrangedSubview(cloudOptionModifierCheckbox)
-        cloudModStack.addArrangedSubview(cloudControlModifierCheckbox)
-        cloudModStack.addArrangedSubview(cloudShiftModifierCheckbox)
-
-        cloudHotkeyPreviewLabel.textColor = .secondaryLabelColor
-        cloudHotkeyPreviewLabel.font = .systemFont(ofSize: 12, weight: .medium)
-
-        cloudHotkeyBadgeView.wantsLayer = true
-        cloudHotkeyBadgeView.layer?.cornerRadius = 6
-        cloudHotkeyBadgeView.layer?.backgroundColor = NSColor.systemIndigo.withAlphaComponent(0.08).cgColor
-        cloudHotkeyBadgeView.layer?.borderWidth = 1
-        cloudHotkeyBadgeView.layer?.borderColor = NSColor.systemIndigo.withAlphaComponent(0.25).cgColor
-        cloudHotkeyBadgeView.translatesAutoresizingMaskIntoConstraints = false
-
-        cloudHotkeyBadgeLabel.font = .monospacedSystemFont(ofSize: 16, weight: .medium)
-        cloudHotkeyBadgeLabel.textColor = .systemIndigo
-        cloudHotkeyBadgeLabel.alignment = .center
-        cloudHotkeyBadgeLabel.translatesAutoresizingMaskIntoConstraints = false
-        cloudHotkeyBadgeView.addSubview(cloudHotkeyBadgeLabel)
-
-        NSLayoutConstraint.activate([
-            cloudHotkeyBadgeLabel.topAnchor.constraint(equalTo: cloudHotkeyBadgeView.topAnchor, constant: 8),
-            cloudHotkeyBadgeLabel.bottomAnchor.constraint(equalTo: cloudHotkeyBadgeView.bottomAnchor, constant: -8),
-            cloudHotkeyBadgeLabel.leadingAnchor.constraint(equalTo: cloudHotkeyBadgeView.leadingAnchor, constant: 16),
-            cloudHotkeyBadgeLabel.trailingAnchor.constraint(equalTo: cloudHotkeyBadgeView.trailingAnchor, constant: -16),
-        ])
-
-        let cloudBadgeRow = NSStackView()
-        cloudBadgeRow.orientation = .horizontal
-        cloudBadgeRow.spacing = 8
-        cloudBadgeRow.alignment = .centerY
-        cloudBadgeRow.addArrangedSubview(makeFieldLabel("Current"))
-        cloudBadgeRow.addArrangedSubview(cloudHotkeyBadgeView)
-
         let stack = makeTabStack(sections: [
-            makeSection(title: "Local Hotkey", views: [
+            makeSection(title: "Correction Hotkey", views: [
                 badgeRow,
                 makeRow(label: makeFieldLabel("Key"), field: hotkeyKeyPopup),
                 makeRow(label: makeFieldLabel("Modifiers"), field: modStack),
                 hotkeyPreviewLabel,
-            ]),
-            makeSection(title: "LLM Hotkey (Ollama or Cloud)", views: [
-                cloudBadgeRow,
-                makeRow(label: makeFieldLabel("Key"), field: cloudHotkeyKeyPopup),
-                makeRow(label: makeFieldLabel("Modifiers"), field: cloudModStack),
-                cloudHotkeyPreviewLabel,
             ]),
             makeButtonRow(),
         ])
@@ -1731,29 +409,15 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
     }
 
     private func buildBehaviorTab() -> NSView {
-        showDiffPreviewCheckbox.setContentHuggingPriority(.required, for: .vertical)
-        clipboardOnlyModeCheckbox.setContentHuggingPriority(.required, for: .vertical)
         soundFeedbackCheckbox.setContentHuggingPriority(.required, for: .vertical)
         notifyOnSuccessCheckbox.setContentHuggingPriority(.required, for: .vertical)
         liveFeedbackCheckbox.setContentHuggingPriority(.required, for: .vertical)
         launchAtLoginCheckbox.setContentHuggingPriority(.required, for: .vertical)
-        diffPreviewDurationField.placeholderString = "5"
-        diffPreviewDurationField.alignment = .left
-
-        let durationDesc = makeDescription("Seconds before the green success indicator fades (1–30). Corrections stay until focus moves away.")
 
         let stack = makeTabStack(sections: [
-            makeSection(title: "Correction", views: [
-                makeCheckboxWithDescription(
-                    checkbox: showDiffPreviewCheckbox,
-                    description: "Shows a side-by-side diff before replacing text"
-                ),
-                makeCheckboxWithDescription(
-                    checkbox: clipboardOnlyModeCheckbox,
-                    description: "Corrected text is copied but not auto-pasted"
-                ),
-                makeRow(label: makeFieldLabel("Success duration (sec)"), field: diffPreviewDurationField),
-                durationDesc,
+            makeSection(title: "Correction box", views: [
+                makeTransparencyRow(),
+                makeDescription("How see-through the correction box is. The text stays solid."),
             ]),
             makeSection(title: "Live Feedback", views: [
                 makeCheckboxWithDescription(
@@ -2016,12 +680,11 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         let providerIndex = providerOptions.firstIndex(of: provider) ?? 0
         providerPopup.selectItem(at: providerIndex)
         ollamaURLField.stringValue = config.ollamaBaseURL
+        magpieURLField.stringValue = config.magpieBaseURL
         launchAtLoginCheckbox.state = config.launchAtLogin ? .on : .off
         launchAtLoginSwitch.state = config.launchAtLogin ? .on : .off
         soundFeedbackCheckbox.state = config.soundFeedbackEnabled ? .on : .off
         notifyOnSuccessCheckbox.state = config.notifyOnSuccess ? .on : .off
-        clipboardOnlyModeCheckbox.state = config.clipboardOnlyMode ? .on : .off
-        showDiffPreviewCheckbox.state = config.showDiffPreview ? .on : .off
         liveFeedbackCheckbox.state = config.liveFeedbackEnabled ? .on : .off
         if let toneIndex = AppConfig.supportedPresets.firstIndex(of: config.tonePreset) {
             tonePresetPopup.selectItem(at: toneIndex)
@@ -2035,22 +698,18 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
             languagePopup.selectItem(at: 0) // auto
         }
         historyLimitField.stringValue = "\(config.historyLimit)"
+        applyFloaterTransparency(config.floaterOpacity)
         timeoutField.stringValue = "\(config.timeoutSeconds)"
-        diffPreviewDurationField.stringValue = "\(config.diffPreviewDuration)"
         loadHotkeyValues(from: config)
-        loadCloudHotkeyValues(from: config)
 
         let rawModel = config.model.trimmingCharacters(in: .whitespacesAndNewlines)
         let selectedModel = rawModel.isEmpty ? AppConfig.defaultModel(for: provider) : rawModel
-        reloadModelOptions(for: provider, selectedModel: selectedModel)
+        applyCachedModels(for: provider, selectedModel: selectedModel)
     }
 
     @objc private func providerPopupChanged() {
         let provider = selectedProvider()
-        reloadModelOptions(for: provider, selectedModel: AppConfig.defaultModel(for: provider))
-        if provider == .ollama {
-            refreshOllamaModelsClicked()
-        }
+        applyCachedModels(for: provider, selectedModel: AppConfig.defaultModel(for: provider))
     }
 
     @objc private func modelPopupChanged() {
@@ -2060,10 +719,6 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
 
     @objc private func hotkeyInputChanged() {
         updateHotkeyPreview()
-    }
-
-    @objc private func cloudHotkeyInputChanged() {
-        updateCloudHotkeyPreview()
     }
 
     private func reloadModelOptions(for provider: CLIProvider, selectedModel: String) {
@@ -2084,43 +739,72 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         refreshModelDescription()
     }
 
+    private func catalogURL() -> URL {
+        configManager.baseDirectoryURL.appendingPathComponent("model-cache.json")
+    }
+
+    private func currentEndpoint(for provider: CLIProvider) -> String {
+        ModelCatalogSupport.endpoint(
+            provider: provider.rawValue,
+            ollamaBaseURL: ollamaURLField.stringValue,
+            magpieBaseURL: magpieURLField.stringValue
+        )
+    }
+
+    private func applyCachedModels(for provider: CLIProvider, selectedModel: String) {
+        let key = ModelCatalogSupport.cacheKey(provider: provider.rawValue, endpoint: currentEndpoint(for: provider))
+        cachedModels = ModelCatalogSupport.models(in: ModelCatalogSupport.load(from: catalogURL()), key: key)
+        reloadModelOptions(for: provider, selectedModel: selectedModel)
+    }
+
     private func modelOptionsForProvider(_ provider: CLIProvider) -> [ModelOption] {
-        let models = provider == .ollama && !installedOllamaModels.isEmpty
-            ? installedOllamaModels : provider.availableModels
-        let predefined = models.map { modelName in
+        let predefined = cachedModels.map { modelName in
             ModelOption(title: modelName, value: modelName)
         }
         return predefined + [ModelOption(title: "Custom", value: nil)]
     }
 
     private func updateHint(for provider: CLIProvider) {
-        ollamaSettingsContainer.isHidden = provider != .ollama
-        if provider == .ollama {
-            hintLabel.stringValue = "Run Ollama, then Refresh Models to select an installed model. Use Custom for any model name. Localhost keeps your text on this Mac."
+        let showOllama = provider == .ollama
+        let showMagpie = provider == .magpie
+        ollamaURLField.superview?.isHidden = !showOllama
+        magpieURLField.superview?.isHidden = !showMagpie
+        serverURLContainer.isHidden = !(showOllama || showMagpie)
+        if provider.usesHTTP {
+            hintLabel.stringValue = "Refresh Models to list what \(provider.displayName) can use. Use Custom for a name that is not listed."
             return
         }
-        hintLabel.stringValue = "If a \(provider.displayName) model is busy or fails, switch models and retry. Default: \(provider.defaultModel)."
+        let fallback = provider.defaultModel.isEmpty ? "the CLI default" : provider.defaultModel
+        hintLabel.stringValue = "Refresh Models to list \(provider.displayName) models. A blank model uses \(fallback)."
     }
 
-    @objc private func refreshOllamaModelsClicked() {
-        let baseURL = ollamaURLField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        refreshOllamaModelsButton.isEnabled = false
-        hintLabel.stringValue = "Connecting to Ollama…"
+    @objc private func refreshModelsClicked() {
+        let provider = selectedProvider()
+        let endpoint = currentEndpoint(for: provider)
+        let executablePath = configManager.loadConfig().resolvedPath(for: provider)
+        refreshModelsButton.isEnabled = false
+        hintLabel.stringValue = "Fetching \(provider.displayName) models…"
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let result = Result { try OllamaClient(baseURL: baseURL, timeoutSeconds: 5).listModels() }
+            let result = Result {
+                try ModelListing.fetch(provider: provider, endpoint: endpoint, executablePath: executablePath)
+            }
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                self.refreshOllamaModelsButton.isEnabled = true
-                guard self.selectedProvider() == .ollama,
-                      self.ollamaURLField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) == baseURL else { return }
+                self.refreshModelsButton.isEnabled = true
+                guard self.selectedProvider() == provider,
+                      self.currentEndpoint(for: provider) == endpoint else { return }
                 switch result {
                 case let .success(models):
+                    let key = ModelCatalogSupport.cacheKey(provider: provider.rawValue, endpoint: endpoint)
+                    var catalog = ModelCatalogSupport.load(from: self.catalogURL())
+                    catalog = ModelCatalogSupport.updating(catalog, key: key, models: models)
+                    try? ModelCatalogSupport.save(catalog, to: self.catalogURL())
                     let selectedModel = self.selectedModel()
-                    self.installedOllamaModels = models
-                    self.reloadModelOptions(for: .ollama, selectedModel: selectedModel)
+                    self.cachedModels = models
+                    self.reloadModelOptions(for: provider, selectedModel: selectedModel)
                     self.hintLabel.stringValue = models.isEmpty
-                        ? "Connected, but no models installed. Run: ollama pull qwen3:1.7b"
-                        : "Connected · \(models.count) installed models. Select a model and Save Changes."
+                        ? "No models returned. Check \(provider.displayName), then click Refresh Models."
+                        : "\(models.count) models. Select one and Save Changes."
                 case let .failure(error):
                     self.hintLabel.stringValue = error.localizedDescription
                 }
@@ -2165,63 +849,15 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
 
     private func updateHotkeyPreview() {
         guard let keyCode = selectedHotkeyKeyCode() else {
-            hotkeyPreviewLabel.stringValue = "Local hotkey: unavailable"
+            hotkeyPreviewLabel.stringValue = "Correction hotkey: unavailable"
             hotkeyBadgeLabel.stringValue = "-"
             return
         }
 
         let modifiers = selectedHotkeyModifiers()
         let display = HotkeySupport.displayString(keyCode: keyCode, modifiers: modifiers)
-        hotkeyPreviewLabel.stringValue = "Local hotkey: \(display)"
+        hotkeyPreviewLabel.stringValue = "Correction hotkey: \(display)"
         hotkeyBadgeLabel.stringValue = display
-    }
-
-    private func loadCloudHotkeyValues(from config: AppConfig) {
-        if let index = hotkeyKeyOptions.firstIndex(where: { $0.keyCode == config.cloudHotkeyKeyCode }) {
-            cloudHotkeyKeyPopup.selectItem(at: index)
-        } else if let defaultIndex = hotkeyKeyOptions.firstIndex(where: { $0.keyCode == HotkeySupport.defaultKeyCode }) {
-            cloudHotkeyKeyPopup.selectItem(at: defaultIndex)
-        } else {
-            cloudHotkeyKeyPopup.selectItem(at: 0)
-        }
-
-        let split = HotkeySupport.splitModifiers(config.cloudHotkeyModifiers)
-        cloudCommandModifierCheckbox.state = split.command ? .on : .off
-        cloudOptionModifierCheckbox.state = split.option ? .on : .off
-        cloudControlModifierCheckbox.state = split.control ? .on : .off
-        cloudShiftModifierCheckbox.state = split.shift ? .on : .off
-
-        updateCloudHotkeyPreview()
-    }
-
-    private func selectedCloudHotkeyKeyCode() -> UInt32? {
-        let index = cloudHotkeyKeyPopup.indexOfSelectedItem
-        guard hotkeyKeyOptions.indices.contains(index) else {
-            return nil
-        }
-        return hotkeyKeyOptions[index].keyCode
-    }
-
-    private func selectedCloudHotkeyModifiers() -> UInt32 {
-        HotkeySupport.makeModifiers(
-            command: cloudCommandModifierCheckbox.state == .on,
-            option: cloudOptionModifierCheckbox.state == .on,
-            control: cloudControlModifierCheckbox.state == .on,
-            shift: cloudShiftModifierCheckbox.state == .on
-        )
-    }
-
-    private func updateCloudHotkeyPreview() {
-        guard let keyCode = selectedCloudHotkeyKeyCode() else {
-            cloudHotkeyPreviewLabel.stringValue = "LLM hotkey: unavailable"
-            cloudHotkeyBadgeLabel.stringValue = "-"
-            return
-        }
-
-        let modifiers = selectedCloudHotkeyModifiers()
-        let display = HotkeySupport.displayString(keyCode: keyCode, modifiers: modifiers)
-        cloudHotkeyPreviewLabel.stringValue = "LLM hotkey: \(display)"
-        cloudHotkeyBadgeLabel.stringValue = display
     }
 
     private func refreshCustomFieldVisibility() {
@@ -2262,7 +898,6 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         let model = selectedModel()
         let historyLimitText = historyLimitField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let timeoutText = timeoutField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let durationText = diffPreviewDurationField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let hotkeyKeyCode = selectedHotkeyKeyCode() else {
             NSSound.beep()
             let alert = NSAlert()
@@ -2286,36 +921,8 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
             NSSound.beep()
             let alert = NSAlert()
             alert.alertStyle = .warning
-            alert.messageText = "Local hotkey modifiers are required"
-            alert.informativeText = "Select at least one modifier key (Command, Option, Control, or Shift) for the local hotkey."
-            alert.runModal()
-            return
-        }
-        guard let cloudHotkeyKeyCode = selectedCloudHotkeyKeyCode() else {
-            NSSound.beep()
-            let alert = NSAlert()
-            alert.alertStyle = .warning
-            alert.messageText = "LLM hotkey key is required"
-            alert.informativeText = "Choose a key for the LLM hotkey before saving."
-            alert.runModal()
-            return
-        }
-        let cloudHotkeyModifiers = selectedCloudHotkeyModifiers()
-        if cloudHotkeyModifiers == 0 {
-            NSSound.beep()
-            let alert = NSAlert()
-            alert.alertStyle = .warning
-            alert.messageText = "LLM hotkey modifiers are required"
-            alert.informativeText = "Select at least one modifier key (Command, Option, Control, or Shift) for the LLM hotkey."
-            alert.runModal()
-            return
-        }
-        if hotkeyKeyCode == cloudHotkeyKeyCode && hotkeyModifiers == cloudHotkeyModifiers {
-            NSSound.beep()
-            let alert = NSAlert()
-            alert.alertStyle = .warning
-            alert.messageText = "Hotkeys must be different"
-            alert.informativeText = "The local and LLM hotkeys cannot use the same key combination."
+            alert.messageText = "Hotkey modifiers are required"
+            alert.informativeText = "Select at least one modifier key (Command, Option, Control, or Shift)."
             alert.runModal()
             return
         }
@@ -2337,27 +944,20 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
             alert.runModal()
             return
         }
-        guard let diffPreviewDuration = Int(durationText), diffPreviewDuration >= 1, diffPreviewDuration <= 30 else {
-            NSSound.beep()
-            let alert = NSAlert()
-            alert.alertStyle = .warning
-            alert.messageText = "Popup duration is invalid"
-            alert.informativeText = "Enter a whole number between 1 and 30 for popup duration."
-            alert.runModal()
-            return
-        }
 
         let ollamaBaseURL = ollamaURLField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if provider == .ollama {
-            guard let url = URL(string: ollamaBaseURL),
+        let magpieBaseURL = magpieURLField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if provider.usesHTTP {
+            let serverURL = provider == .magpie ? magpieBaseURL : ollamaBaseURL
+            guard let url = URL(string: serverURL),
                   ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
                   let host = url.host, !host.isEmpty,
                   url.user == nil, url.password == nil,
                   url.query == nil, url.fragment == nil else {
                 let alert = NSAlert()
                 alert.alertStyle = .warning
-                alert.messageText = "Ollama server URL is invalid"
-                alert.informativeText = "Enter an HTTP or HTTPS server URL, for example http://127.0.0.1:11434."
+                alert.messageText = "\(provider.displayName) server URL is invalid"
+                alert.informativeText = "Enter an HTTP or HTTPS server URL without a query or fragment."
                 alert.runModal()
                 return
             }
@@ -2367,13 +967,12 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         config.provider = provider.rawValue
         config.model = model
         config.ollamaBaseURL = ollamaBaseURL
+        config.magpieBaseURL = magpieBaseURL
         config.hotkeyKeyCode = hotkeyKeyCode
         config.hotkeyModifiers = hotkeyModifiers
         config.launchAtLogin = (launchAtLoginSwitch.state == .on)
         config.soundFeedbackEnabled = (soundFeedbackCheckbox.state == .on)
         config.notifyOnSuccess = (notifyOnSuccessCheckbox.state == .on)
-        config.clipboardOnlyMode = (clipboardOnlyModeCheckbox.state == .on)
-        config.showDiffPreview = (showDiffPreviewCheckbox.state == .on)
         config.liveFeedbackEnabled = (liveFeedbackCheckbox.state == .on)
         let toneIndex = tonePresetPopup.indexOfSelectedItem
         config.tonePreset = AppConfig.supportedPresets.indices.contains(toneIndex)
@@ -2386,13 +985,7 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
             : "auto"
         config.historyLimit = historyLimit
         config.timeoutSeconds = timeoutSeconds
-        config.diffPreviewDuration = diffPreviewDuration
-        config.cloudHotkeyKeyCode = cloudHotkeyKeyCode
-        config.cloudHotkeyModifiers = cloudHotkeyModifiers
-
-        // Local Models tab: save python path override
-        let pythonPathValue = localModelsPythonPathField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        config.localModelPythonPath = pythonPathValue == "/usr/bin/python3" ? "" : pythonPathValue
+        config.floaterOpacity = AppConfig.clampedFloaterOpacity(1 - floaterTransparencySlider.doubleValue / 100)
 
         do {
             try configManager.saveConfig(config)
@@ -2471,4 +1064,131 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
             })
         }
     }
+
+    private func configureServerURLField(_ field: NSTextField) {
+        let fieldWidth = SettingsLayoutSupport.windowWidth - 64 - 32 - SettingsLayoutSupport.labelWidth - 8
+        field.lineBreakMode = .byClipping
+        field.maximumNumberOfLines = 1
+        field.cell?.wraps = false
+        field.cell?.isScrollable = true
+        field.usesSingleLineMode = true
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        field.widthAnchor.constraint(equalToConstant: fieldWidth).isActive = true
+    }
+
+    private func fitSettingsWindowHeight() {
+        guard let window else { return }
+        tabViews.values.forEach { $0.layoutSubtreeIfNeeded() }
+        let maxTabHeight = tabViews.values.map(\.fittingSize.height).max() ?? SettingsLayoutSupport.minWindowHeight
+        let needed = max(ceil(maxTabHeight), SettingsLayoutSupport.minWindowHeight)
+        let screenHeight = (window.screen ?? NSScreen.main)?.visibleFrame.height ?? needed
+        let height = min(needed, max(SettingsLayoutSupport.minWindowHeight, screenHeight - 40))
+        var frame = window.frame
+        guard abs(frame.height - height) >= 1 else { return }
+        frame.origin.y -= height - frame.height
+        frame.size.height = height
+        window.setFrame(frame, display: window.isVisible)
+    }
+
+    private func makeTransparencyRow() -> NSView {
+        floaterTransparencySlider.minValue = 0
+        floaterTransparencySlider.maxValue = (1 - AppConfig.minimumFloaterOpacity) * 100
+        floaterTransparencySlider.isContinuous = true
+        floaterTransparencySlider.target = self
+        floaterTransparencySlider.action = #selector(floaterTransparencyChanged)
+        floaterTransparencySlider.toolTip = "Drag right to make the correction box more transparent."
+        floaterTransparencySlider.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        floaterTransparencyValue.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        floaterTransparencyValue.alignment = .right
+        floaterTransparencyValue.setContentHuggingPriority(.required, for: .horizontal)
+        floaterTransparencyValue.widthAnchor.constraint(equalToConstant: 40).isActive = true
+
+        let row = NSStackView(views: [
+            makeFieldLabel("Transparency"),
+            floaterTransparencySlider,
+            floaterTransparencyValue,
+            floaterTransparencySwatch,
+        ])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        return row
+    }
+
+    private func applyFloaterTransparency(_ opacity: Double) {
+        let clamped = AppConfig.clampedFloaterOpacity(opacity)
+        floaterTransparencySlider.doubleValue = (1 - clamped) * 100
+        refreshFloaterTransparencyPreview()
+    }
+
+    @objc private func floaterTransparencyChanged() {
+        refreshFloaterTransparencyPreview()
+    }
+
+    private func refreshFloaterTransparencyPreview() {
+        let percent = Int(floaterTransparencySlider.doubleValue.rounded())
+        floaterTransparencyValue.stringValue = "\(percent)%"
+        floaterTransparencySwatch.opacity = CGFloat(
+            AppConfig.clampedFloaterOpacity(1 - floaterTransparencySlider.doubleValue / 100)
+        )
+    }
 }
+
+private final class FloaterTransparencySwatch: NSView {
+    var opacity: CGFloat = CGFloat(AppConfig.defaultFloaterOpacity) {
+        didSet { needsDisplay = true }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: 64).isActive = true
+        heightAnchor.constraint(equalToConstant: 28).isActive = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("FloaterTransparencySwatch does not support NSCoder")
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let light = NSColor.controlBackgroundColor
+        let dark = NSColor.separatorColor
+        let square: CGFloat = 4
+        var y: CGFloat = 0
+        var row = 0
+        while y < bounds.height {
+            var x: CGFloat = 0
+            var column = 0
+            while x < bounds.width {
+                ((row + column).isMultiple(of: 2) ? light : dark).setFill()
+                NSRect(x: x, y: y, width: square, height: square).fill()
+                x += square
+                column += 1
+            }
+            y += square
+            row += 1
+        }
+
+        let plate = bounds.insetBy(dx: 6, dy: 4)
+        let path = NSBezierPath(roundedRect: plate, xRadius: 5, yRadius: 5)
+        NSColor.windowBackgroundColor.withAlphaComponent(opacity).setFill()
+        path.fill()
+        NSColor.separatorColor.setStroke()
+        path.lineWidth = 0.5
+        path.stroke()
+
+        let sample = "Aa" as NSString
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: NSColor.labelColor,
+        ]
+        let size = sample.size(withAttributes: attributes)
+        sample.draw(
+            at: NSPoint(x: plate.midX - size.width / 2, y: plate.midY - size.height / 2),
+            withAttributes: attributes
+        )
+    }
+}
+

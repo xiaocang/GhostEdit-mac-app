@@ -217,6 +217,38 @@ enum DiffSupport {
         return coalesce(edits)
     }
 
+    /// Keep changes and a short run of surrounding text so a narrow floater can show the edit.
+    static func compactChangedSegments(_ segments: [DiffSegment], contextCharacters: Int = 18) -> [DiffSegment] {
+        guard segments.contains(where: { $0.kind != .equal }) else {
+            return segments
+        }
+        let limit = max(contextCharacters, 0)
+        var result: [DiffSegment] = []
+        for index in segments.indices {
+            let segment = segments[index]
+            if segment.kind != .equal {
+                result.append(segment)
+                continue
+            }
+            let changedBefore = segments[..<index].contains { $0.kind != .equal }
+            let changedAfter = segments[(index + 1)...].contains { $0.kind != .equal }
+            let budget = (changedBefore && changedAfter) ? limit * 2 : limit
+            if segment.text.count <= budget {
+                result.append(segment)
+                continue
+            }
+            if changedBefore && changedAfter {
+                result.append(DiffSegment(kind: .equal, text: String(segment.text.prefix(limit)) + "…"))
+                result.append(DiffSegment(kind: .equal, text: "…" + String(segment.text.suffix(limit))))
+            } else if changedBefore {
+                result.append(DiffSegment(kind: .equal, text: String(segment.text.prefix(limit)) + "…"))
+            } else {
+                result.append(DiffSegment(kind: .equal, text: "…" + String(segment.text.suffix(limit))))
+            }
+        }
+        return result
+    }
+
     // MARK: - Helpers
 
     private static func wordCount(_ text: String) -> Int {

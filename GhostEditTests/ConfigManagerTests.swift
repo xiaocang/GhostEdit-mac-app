@@ -38,16 +38,6 @@ final class ConfigManagerTests: XCTestCase {
         XCTAssertEqual(config.launchAtLogin, AppConfig.default.launchAtLogin)
         XCTAssertEqual(config.historyLimit, AppConfig.default.historyLimit)
         XCTAssertEqual(config.developerMode, AppConfig.default.developerMode)
-        XCTAssertEqual(config.localModelRepoID, AppConfig.default.localModelRepoID)
-        XCTAssertEqual(config.localModelCustomModels, AppConfig.default.localModelCustomModels)
-        XCTAssertEqual(config.localModelPromptTemplates, AppConfig.default.localModelPromptTemplates)
-        XCTAssertEqual(config.localModelPythonPath, AppConfig.default.localModelPythonPath)
-        XCTAssertEqual(config.cloudHotkeyKeyCode, AppConfig.default.cloudHotkeyKeyCode)
-        XCTAssertEqual(config.cloudHotkeyModifiers, AppConfig.default.cloudHotkeyModifiers)
-
-        // Scripts directory should be created
-        let scriptsDir = manager.baseDirectoryURL.appendingPathComponent("scripts", isDirectory: true)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: scriptsDir.path))
     }
 
     func testBootstrapMigratesLegacyDirectory() throws {
@@ -493,22 +483,43 @@ final class ConfigManagerTests: XCTestCase {
 
     func testLanguageInstructionForAuto() {
         let instruction = AppConfig.languageInstruction(for: "auto")
-        XCTAssertEqual(instruction, "Detect the language of the input text and respond in the same language.")
+        XCTAssertEqual(instruction, "Keep the input language. Do not translate.")
     }
 
     func testLanguageInstructionForEmpty() {
         let instruction = AppConfig.languageInstruction(for: "")
-        XCTAssertEqual(instruction, "Detect the language of the input text and respond in the same language.")
+        XCTAssertEqual(instruction, "Keep the input language. Do not translate.")
+        XCTAssertEqual(AppConfig.languageInstruction(for: "   "), instruction)
     }
 
     func testLanguageInstructionForKnownLanguage() {
-        XCTAssertEqual(AppConfig.languageInstruction(for: "fr"), "Respond in French.")
-        XCTAssertEqual(AppConfig.languageInstruction(for: "ja"), "Respond in Japanese.")
-        XCTAssertEqual(AppConfig.languageInstruction(for: "ta"), "Respond in Tamil.")
+        let french = AppConfig.languageInstruction(for: "fr")
+        XCTAssertEqual(french, "Target language: French. Translate the user text into French. If it is already French, correct the grammar. Do not return the original language.")
+        XCTAssertTrue(AppConfig.languageInstruction(for: "ja").contains("Target language: Japanese."))
+        XCTAssertTrue(AppConfig.languageInstruction(for: "ta").contains("Translate the user text into Tamil."))
+        XCTAssertTrue(AppConfig.languageInstruction(for: " FR ").contains("Target language: French."))
     }
 
     func testLanguageInstructionForUnknownLanguageUsesRawValue() {
-        XCTAssertEqual(AppConfig.languageInstruction(for: "klingon"), "Respond in klingon.")
+        XCTAssertEqual(
+            AppConfig.languageInstruction(for: "klingon"),
+            "Target language: klingon. Translate the user text into klingon. If it is already klingon, correct the grammar. Do not return the original language."
+        )
+    }
+
+
+    func testCorrectionSystemPromptOmitsContractWhenDisabled() {
+        XCTAssertEqual(
+            AppConfig.correctionSystemPrompt(systemPrompt: "Fix", language: "en", includeLanguageContract: false),
+            "Fix"
+        )
+        let prompt = AppConfig.correctionSystemPrompt(systemPrompt: "Fix", language: "en", includeLanguageContract: true)
+        XCTAssertTrue(prompt.hasPrefix("Fix\n\n"))
+        XCTAssertTrue(prompt.contains("Target language: English."))
+        XCTAssertTrue(prompt.contains("Translate the user text into English."))
+        XCTAssertTrue(prompt.contains(AppConfig.outputFormatInstruction))
+        XCTAssertTrue(prompt.contains("<<<TEXT>>>"))
+        XCTAssertTrue(prompt.contains("<<<END>>>"))
     }
 
     func testLanguageRoundTripsViaConfigManager() throws {
@@ -538,50 +549,6 @@ final class ConfigManagerTests: XCTestCase {
         """
         let config = try JSONDecoder().decode(AppConfig.self, from: Data(json.utf8))
         XCTAssertEqual(config.resolvedLanguage, "auto")
-    }
-
-    func testSaveConfigNormalizesInvalidLocalModelPromptTemplatesJSON() throws {
-        let (manager, _) = makeManager()
-        try manager.bootstrapIfNeeded()
-
-        var config = manager.loadConfig()
-        config.localModelPromptTemplates = "{not-json"
-
-        try manager.saveConfig(config)
-        manager.invalidateCache()
-
-        let loaded = manager.loadConfig()
-        XCTAssertEqual(loaded.localModelPromptTemplates, "{}")
-    }
-
-    func testSaveConfigNormalizesBlankLocalModelPromptTemplatesJSON() throws {
-        let (manager, _) = makeManager()
-        try manager.bootstrapIfNeeded()
-
-        var config = manager.loadConfig()
-        config.localModelPromptTemplates = "   "
-
-        try manager.saveConfig(config)
-        manager.invalidateCache()
-
-        let loaded = manager.loadConfig()
-        XCTAssertEqual(loaded.localModelPromptTemplates, "{}")
-    }
-
-    func testSaveConfigPreservesValidLocalModelPromptTemplatesJSON() throws {
-        let (manager, _) = makeManager()
-        try manager.bootstrapIfNeeded()
-
-        var config = manager.loadConfig()
-        config.localModelPromptTemplates = "{\"grammarly/coedit-large\":\"Custom {text}\"}"
-
-        try manager.saveConfig(config)
-        manager.invalidateCache()
-
-        let loaded = manager.loadConfig()
-        let data = try XCTUnwrap(loaded.localModelPromptTemplates.data(using: .utf8))
-        let decoded = try JSONDecoder().decode([String: String].self, from: data)
-        XCTAssertEqual(decoded["grammarly/coedit-large"], "Custom {text}")
     }
 
     func testSupportedLanguagesContainsAutoAndEnglish() {
@@ -645,33 +612,6 @@ final class ConfigManagerTests: XCTestCase {
         XCTAssertTrue(manager.loadConfig().notifyOnSuccess)
     }
 
-    // MARK: - Clipboard-Only Mode Tests
-
-    func testClipboardOnlyModeDefaultIsFalse() {
-        XCTAssertFalse(AppConfig.default.clipboardOnlyMode)
-    }
-
-    func testClipboardOnlyModeBackwardCompatJSON() throws {
-        let json = """
-        {"provider": "claude"}
-        """
-        let config = try JSONDecoder().decode(AppConfig.self, from: Data(json.utf8))
-        XCTAssertFalse(config.clipboardOnlyMode)
-    }
-
-    func testClipboardOnlyModeRoundTrip() throws {
-        let (manager, _) = makeManager()
-        try manager.bootstrapIfNeeded()
-
-        var config = manager.loadConfig()
-        XCTAssertFalse(config.clipboardOnlyMode)
-
-        config.clipboardOnlyMode = true
-        try manager.saveConfig(config)
-        manager.invalidateCache()
-        XCTAssertTrue(manager.loadConfig().clipboardOnlyMode)
-    }
-
     // MARK: - Tone/Style Presets Tests
 
     func testTonePresetDefaultIsDefault() {
@@ -725,80 +665,6 @@ final class ConfigManagerTests: XCTestCase {
         XCTAssertNotNil(AppConfig.promptForPreset(" Professional "))
     }
 
-    // MARK: - Local Model Config Fields
-
-    func testLocalModelFieldsDefaultValues() {
-        let config = AppConfig.default
-        XCTAssertEqual(config.localModelRepoID, "")
-        XCTAssertEqual(config.localModelCustomModels, "[]")
-        XCTAssertEqual(config.localModelPromptTemplates, "{}")
-        XCTAssertEqual(config.localModelPythonPath, "")
-    }
-
-    func testLocalModelFieldsRoundTrip() throws {
-        let (manager, _) = makeManager()
-        try manager.bootstrapIfNeeded()
-
-        var config = manager.loadConfig()
-        config.localModelRepoID = "grammarly/coedit-large"
-        config.localModelCustomModels = "[{\"repoID\":\"custom/model\"}]"
-        config.localModelPromptTemplates = "{\"grammarly/coedit-large\":\"Fix grammar: {text}\"}"
-        config.localModelPythonPath = "/opt/homebrew/bin/python3"
-        try manager.saveConfig(config)
-        manager.invalidateCache()
-
-        let reloaded = manager.loadConfig()
-        XCTAssertEqual(reloaded.localModelRepoID, "grammarly/coedit-large")
-        XCTAssertEqual(reloaded.localModelCustomModels, "[{\"repoID\":\"custom/model\"}]")
-        let promptTemplates = try XCTUnwrap(reloaded.localModelPromptTemplates.data(using: .utf8))
-        let decodedTemplates = try JSONDecoder().decode([String: String].self, from: promptTemplates)
-        XCTAssertEqual(decodedTemplates["grammarly/coedit-large"], "Fix grammar: {text}")
-        XCTAssertEqual(reloaded.localModelPythonPath, "/opt/homebrew/bin/python3")
-    }
-
-    func testScriptsDirectoryURL() {
-        let (manager, homeURL) = makeManager()
-        let expected = homeURL.appendingPathComponent(".ghostedit/scripts", isDirectory: true)
-        XCTAssertEqual(manager.scriptsDirectoryURL, expected)
-    }
-
-    func testLocalModelFieldsBackwardCompatibility() throws {
-        let (manager, _) = makeManager()
-        try manager.bootstrapIfNeeded()
-
-        // Write JSON without the new fields (simulating an old config)
-        let oldJSON = """
-        {
-            "provider": "claude",
-            "model": "sonnet",
-            "timeoutSeconds": 60,
-            "hotkeyKeyCode": 14,
-            "hotkeyModifiers": 256
-        }
-        """
-        try oldJSON.write(to: manager.configURL, atomically: true, encoding: .utf8)
-        manager.invalidateCache()
-
-        let config = manager.loadConfig()
-        XCTAssertEqual(config.localModelRepoID, "")
-        XCTAssertEqual(config.localModelCustomModels, "[]")
-        XCTAssertEqual(config.localModelPromptTemplates, "{}")
-        XCTAssertEqual(config.localModelPythonPath, "")
-    }
-
-    func testLocalModelPromptTemplatesNormalizeInvalidJSON() throws {
-        let (manager, _) = makeManager()
-        try manager.bootstrapIfNeeded()
-
-        var config = manager.loadConfig()
-        config.localModelPromptTemplates = "not-json"
-        try manager.saveConfig(config)
-        manager.invalidateCache()
-
-        let reloaded = manager.loadConfig()
-        XCTAssertEqual(reloaded.localModelPromptTemplates, "{}")
-    }
-
     func testTonePresetNormalizesToDefaultForInvalidValue() throws {
         let (manager, _) = makeManager()
         try manager.bootstrapIfNeeded()
@@ -808,71 +674,6 @@ final class ConfigManagerTests: XCTestCase {
         try manager.saveConfig(config)
         manager.invalidateCache()
         XCTAssertEqual(manager.loadConfig().tonePreset, "default")
-    }
-
-    // MARK: - Cloud Hotkey Tests
-
-    func testCloudHotkeyDefaultValues() {
-        let config = AppConfig.default
-        XCTAssertEqual(config.cloudHotkeyKeyCode, 14) // E key
-        XCTAssertEqual(config.cloudHotkeyModifiers, 768) // Cmd+Shift
-    }
-
-    func testCloudHotkeyDecoderFallsBackToBaseWithShift() throws {
-        // Old JSON without cloud hotkey fields - should default to base key + Shift
-        let json = """
-        {"hotkeyKeyCode": 0, "hotkeyModifiers": 256}
-        """
-        let config = try JSONDecoder().decode(AppConfig.self, from: Data(json.utf8))
-        XCTAssertEqual(config.cloudHotkeyKeyCode, 0) // same key as base
-        XCTAssertEqual(config.cloudHotkeyModifiers, 768) // 256 (Cmd) | 512 (Shift) = 768
-    }
-
-    func testCloudHotkeyRoundTrip() throws {
-        let (manager, _) = makeManager()
-        try manager.bootstrapIfNeeded()
-
-        var config = manager.loadConfig()
-        config.cloudHotkeyKeyCode = 1 // S key
-        config.cloudHotkeyModifiers = 4352 // Cmd+Option+Shift
-        try manager.saveConfig(config)
-        manager.invalidateCache()
-
-        let reloaded = manager.loadConfig()
-        XCTAssertEqual(reloaded.cloudHotkeyKeyCode, 1)
-        XCTAssertEqual(reloaded.cloudHotkeyModifiers, 4352)
-    }
-
-    func testCloudHotkeyExplicitValuesPreservedOnDecode() throws {
-        let json = """
-        {"hotkeyKeyCode": 14, "hotkeyModifiers": 256, "cloudHotkeyKeyCode": 3, "cloudHotkeyModifiers": 2048}
-        """
-        let config = try JSONDecoder().decode(AppConfig.self, from: Data(json.utf8))
-        XCTAssertEqual(config.cloudHotkeyKeyCode, 3) // F key
-        XCTAssertEqual(config.cloudHotkeyModifiers, 2048) // Control
-    }
-
-    func testCloudHotkeyBackwardCompatibility() throws {
-        let (manager, _) = makeManager()
-        try manager.bootstrapIfNeeded()
-
-        // Write JSON without cloud hotkey fields (simulating an old config)
-        let oldJSON = """
-        {
-            "provider": "claude",
-            "model": "sonnet",
-            "timeoutSeconds": 60,
-            "hotkeyKeyCode": 14,
-            "hotkeyModifiers": 256
-        }
-        """
-        try oldJSON.write(to: manager.configURL, atomically: true, encoding: .utf8)
-        manager.invalidateCache()
-
-        let config = manager.loadConfig()
-        // Should fall back to base key + Shift
-        XCTAssertEqual(config.cloudHotkeyKeyCode, 14)
-        XCTAssertEqual(config.cloudHotkeyModifiers, 768) // 256 | 512
     }
 
     func testOllamaConfigurationSurvivesSaveReloadAndExport() throws {
@@ -922,7 +723,7 @@ final class ConfigManagerTests: XCTestCase {
     }
 
     func testCLIPathGuidanceKeysCanConfigureTheirCorrespondingRuntime() throws {
-        for provider in [CLIProvider.claude, .codex, .gemini] {
+        for provider in [CLIProvider.claude, .codex, .gemini, .grok] {
             let path = "/custom/tools/\(provider.rawValue)"
             let data = try JSONSerialization.data(withJSONObject: [
                 "provider": provider.rawValue,
@@ -931,7 +732,63 @@ final class ConfigManagerTests: XCTestCase {
             let config = try JSONDecoder().decode(AppConfig.self, from: data)
             XCTAssertEqual(config.resolvedPath(for: provider), path,
                            "The configuration key shown in setup guidance must control that provider's executable")
+            XCTAssertFalse(provider.usesHTTP)
         }
+        XCTAssertTrue(CLIProvider.ollama.usesHTTP)
+        XCTAssertTrue(CLIProvider.magpie.usesHTTP)
+        XCTAssertNil(AppConfig.default.resolvedPath(for: .magpie))
+    }
+
+    func testGrokAndMagpieSettingsSurviveSave() throws {
+        let (manager, _) = makeManager()
+        try manager.bootstrapIfNeeded()
+        var config = manager.loadConfig()
+        config.provider = "magpie"
+        config.model = "claude/claude-haiku-4-5"
+        config.grokPath = "/opt/homebrew/bin/grok"
+        config.magpieBaseURL = " http://127.0.0.1:3425 "
+        try manager.saveConfig(config)
+        manager.invalidateCache()
+        let loaded = manager.loadConfig()
+        XCTAssertEqual(loaded.resolvedProvider, .magpie)
+        XCTAssertEqual(loaded.grokPath, "/opt/homebrew/bin/grok")
+        XCTAssertEqual(loaded.magpieBaseURL, "http://127.0.0.1:3425")
+        XCTAssertEqual(loaded.resolvedModel(), "claude/claude-haiku-4-5")
+        XCTAssertEqual(CLIProvider.grok.displayName, "Grok")
+        XCTAssertEqual(CLIProvider.magpie.authCommand, "magpie")
+    }
+
+    func testFloaterOpacityDefaultsClampsAndRoundTrips() throws {
+        let missing = try JSONDecoder().decode(AppConfig.self, from: Data(#"{"provider":"claude"}"#.utf8))
+        XCTAssertEqual(missing.floaterOpacity, AppConfig.defaultFloaterOpacity)
+
+        let present = try JSONDecoder().decode(AppConfig.self, from: Data(#"{"floaterOpacity":0.7}"#.utf8))
+        XCTAssertEqual(present.floaterOpacity, 0.7, accuracy: 0.0001)
+
+        let nullValue = try JSONDecoder().decode(AppConfig.self, from: Data(#"{"floaterOpacity":null}"#.utf8))
+        XCTAssertEqual(nullValue.floaterOpacity, AppConfig.defaultFloaterOpacity)
+        XCTAssertEqual(AppConfig.clampedFloaterOpacity(.nan), AppConfig.defaultFloaterOpacity)
+        XCTAssertEqual(AppConfig.clampedFloaterOpacity(.infinity), AppConfig.defaultFloaterOpacity)
+
+        let (manager, _) = makeManager()
+        try manager.bootstrapIfNeeded()
+        var config = manager.loadConfig()
+        config.floaterOpacity = 2
+        try manager.saveConfig(config)
+        manager.invalidateCache()
+        XCTAssertEqual(manager.loadConfig().floaterOpacity, AppConfig.maximumFloaterOpacity)
+
+        config = manager.loadConfig()
+        config.floaterOpacity = -1
+        try manager.saveConfig(config)
+        manager.invalidateCache()
+        XCTAssertEqual(manager.loadConfig().floaterOpacity, AppConfig.minimumFloaterOpacity)
+
+        config = manager.loadConfig()
+        config.floaterOpacity = 0.55
+        try manager.saveConfig(config)
+        manager.invalidateCache()
+        XCTAssertEqual(manager.loadConfig().floaterOpacity, 0.55, accuracy: 0.0001)
     }
 
     private func makeManager() -> (ConfigManager, URL) {

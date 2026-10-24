@@ -164,13 +164,15 @@ final class ShellRunner {
     func correctTextStreaming(
         systemPrompt: String,
         selectedText: String,
+        includeLanguageContract: Bool = true,
         onChunk: @escaping (String) -> Void
     ) throws -> String {
         let config = configManager.loadConfig()
         let provider = config.resolvedProvider
-        if provider == .ollama {
-            return try correctTextWithOllama(systemPrompt: systemPrompt, selectedText: selectedText,
-                                            config: config, onChunk: onChunk)
+        if provider.usesHTTP {
+            return try correctTextWithHTTP(systemPrompt: systemPrompt, selectedText: selectedText,
+                                            config: config, includeLanguageContract: includeLanguageContract,
+                                            onChunk: onChunk)
         }
 
         // Try the persistent session first (Claude only, zero bootstrap overhead).
@@ -178,6 +180,7 @@ final class ShellRunner {
             systemPrompt: systemPrompt,
             selectedText: selectedText,
             config: config,
+            includeLanguageContract: includeLanguageContract,
             onChunk: onChunk
         ) {
             return result
@@ -191,11 +194,12 @@ final class ShellRunner {
         devLog(.cliResolution, "Resolved CLI path: \(executablePath)")
         let model = config.resolvedModel(for: provider)
 
-        var augmentedPrompt = systemPrompt
-        if let langInstruction = AppConfig.languageInstruction(for: config.resolvedLanguage) {
-            augmentedPrompt = "\(systemPrompt) \(langInstruction)"
-        }
-        let input = "\(augmentedPrompt)\n\n\(selectedText)"
+        let input = preparedPrompt(
+            systemPrompt: systemPrompt,
+            selectedText: selectedText,
+            language: config.resolvedLanguage,
+            includeLanguageContract: includeLanguageContract
+        )
 
         devLog(.cliExecution, "Launching \(provider.executableName) (streaming) with model: \(model.isEmpty ? "(default)" : model)")
         let output = try runCLIStreaming(
@@ -207,7 +211,7 @@ final class ShellRunner {
             onChunk: onChunk
         )
 
-        let trimmed = ShellRunner.trimPreservingInternalNewlines(output)
+        let trimmed = finishedCLIOutput(output, includeLanguageContract: includeLanguageContract)
         guard !trimmed.isEmpty else {
             devLog(.cliResponse, "CLI returned empty response")
             throw ShellRunnerError.emptyResponse
@@ -217,18 +221,20 @@ final class ShellRunner {
         return trimmed
     }
 
-    func correctText(systemPrompt: String, selectedText: String) throws -> String {
+    func correctText(systemPrompt: String, selectedText: String, includeLanguageContract: Bool = true) throws -> String {
         let config = configManager.loadConfig()
         let provider = config.resolvedProvider
-        if provider == .ollama {
-            return try correctTextWithOllama(systemPrompt: systemPrompt, selectedText: selectedText, config: config)
+        if provider.usesHTTP {
+            return try correctTextWithHTTP(systemPrompt: systemPrompt, selectedText: selectedText,
+                                            config: config, includeLanguageContract: includeLanguageContract)
         }
 
         // Try the persistent session first (Claude only, zero bootstrap overhead).
         if let result = tryPersistentSession(
             systemPrompt: systemPrompt,
             selectedText: selectedText,
-            config: config
+            config: config,
+            includeLanguageContract: includeLanguageContract
         ) {
             return result
         }
@@ -241,12 +247,15 @@ final class ShellRunner {
         devLog(.cliResolution, "Resolved CLI path: \(executablePath)")
         let model = config.resolvedModel(for: provider)
 
-        var augmentedPrompt = systemPrompt
-        if let langInstruction = AppConfig.languageInstruction(for: config.resolvedLanguage) {
-            augmentedPrompt = "\(systemPrompt) \(langInstruction)"
-            devLog(.cliExecution, "Language: \(config.resolvedLanguage) → \(langInstruction)")
+        let input = preparedPrompt(
+            systemPrompt: systemPrompt,
+            selectedText: selectedText,
+            language: config.resolvedLanguage,
+            includeLanguageContract: includeLanguageContract
+        )
+        if includeLanguageContract {
+            devLog(.cliExecution, "Language: \(config.resolvedLanguage)")
         }
-        let input = "\(augmentedPrompt)\n\n\(selectedText)"
 
         devLog(.cliExecution, "Launching \(provider.executableName) with model: \(model.isEmpty ? "(default)" : model), timeout: \(config.timeoutSeconds)s")
         let output = try runCLI(
@@ -257,7 +266,7 @@ final class ShellRunner {
             timeoutSeconds: config.timeoutSeconds
         )
 
-        let trimmed = ShellRunner.trimPreservingInternalNewlines(output)
+        let trimmed = finishedCLIOutput(output, includeLanguageContract: includeLanguageContract)
         guard !trimmed.isEmpty else {
             devLog(.cliResponse, "CLI returned empty response")
             throw ShellRunnerError.emptyResponse
@@ -267,20 +276,40 @@ final class ShellRunner {
         return trimmed
     }
 
-    private func correctTextWithOllama(
+    private func correctTextWithHTTP(
         systemPrompt: String,
         selectedText: String,
         config: AppConfig,
+        includeLanguageContract: Bool,
         onChunk: ((String) -> Void)? = nil
     ) throws -> String {
-        var prompt = systemPrompt
-        if let language = AppConfig.languageInstruction(for: config.resolvedLanguage) {
-            prompt += " \(language)"
+        let prompt = AppConfig.correctionSystemPrompt(
+            systemPrompt: systemPrompt,
+            language: config.resolvedLanguage,
+            includeLanguageContract: includeLanguageContract
+        )
+        let userText = includeLanguageContract ? Self.taggedSelectedText(selectedText) : selectedText
+        devLog(.cliExecution, "GhostEdit HTTP user fence prefix=\(userText.hasPrefix("<selected>"))")
+        let provider = config.resolvedProvider
+        let text: String
+        if provider == .magpie {
+            text = try MagpieClient(baseURL: config.magpieBaseURL, timeoutSeconds: config.timeoutSeconds,
+                                    sessionConfiguration: ollamaSessionConfiguration)
+                .correctText(systemPrompt: prompt, selectedText: userText,
+                             model: config.resolvedModel(for: .magpie), onChunk: onChunk)
+        } else {
+            text = try OllamaClient(baseURL: config.ollamaBaseURL, timeoutSeconds: config.timeoutSeconds,
+                                    sessionConfiguration: ollamaSessionConfiguration)
+                .correctText(systemPrompt: prompt, selectedText: userText,
+                             model: config.resolvedModel(for: .ollama), onChunk: onChunk)
         }
-        return try OllamaClient(baseURL: config.ollamaBaseURL, timeoutSeconds: config.timeoutSeconds,
-                                sessionConfiguration: ollamaSessionConfiguration)
-            .correctText(systemPrompt: prompt, selectedText: selectedText,
-                         model: config.resolvedModel(for: .ollama), onChunk: onChunk)
+        guard includeLanguageContract else { return text }
+        let cleaned = Self.correctionOnly(in: text)
+        guard !cleaned.isEmpty else {
+            devLog(.cliResponse, "HTTP correction was empty after stripping extra text")
+            throw ShellRunnerError.emptyResponse
+        }
+        return cleaned
     }
 
     func correctTextPreservingTokens(
@@ -376,7 +405,8 @@ final class ShellRunner {
     private func tryPersistentSession(
         systemPrompt: String,
         selectedText: String,
-        config: AppConfig
+        config: AppConfig,
+        includeLanguageContract: Bool
     ) -> String? {
         guard config.resolvedProvider == .claude else { return nil }
         persistentSessionLock.lock()
@@ -387,18 +417,18 @@ final class ShellRunner {
         }
         persistentSessionLock.unlock()
 
-        var augmentedPrompt = systemPrompt
-        if let langInstruction = AppConfig.languageInstruction(for: config.resolvedLanguage) {
-            augmentedPrompt = "\(systemPrompt) \(langInstruction)"
-            devLog(.cliExecution, "Language: \(config.resolvedLanguage) → \(langInstruction)")
-        }
-        let input = "\(augmentedPrompt)\n\n\(selectedText)"
+        let input = preparedPrompt(
+            systemPrompt: systemPrompt,
+            selectedText: selectedText,
+            language: config.resolvedLanguage,
+            includeLanguageContract: includeLanguageContract
+        )
 
         devLog(.cliExecution, "Using persistent session (zero bootstrap overhead)")
 
         do {
             let result = try session.send(prompt: input, timeoutSeconds: config.timeoutSeconds)
-            let trimmed = ShellRunner.trimPreservingInternalNewlines(result.text)
+            let trimmed = finishedCLIOutput(result.text, includeLanguageContract: includeLanguageContract)
             guard !trimmed.isEmpty else {
                 devLog(.cliResponse, "Persistent session returned empty response, falling back")
                 return nil
@@ -422,6 +452,7 @@ final class ShellRunner {
         systemPrompt: String,
         selectedText: String,
         config: AppConfig,
+        includeLanguageContract: Bool,
         onChunk: @escaping (String) -> Void
     ) -> String? {
         guard config.resolvedProvider == .claude else { return nil }
@@ -433,11 +464,12 @@ final class ShellRunner {
         }
         persistentSessionLock.unlock()
 
-        var augmentedPrompt = systemPrompt
-        if let langInstruction = AppConfig.languageInstruction(for: config.resolvedLanguage) {
-            augmentedPrompt = "\(systemPrompt) \(langInstruction)"
-        }
-        let input = "\(augmentedPrompt)\n\n\(selectedText)"
+        let input = preparedPrompt(
+            systemPrompt: systemPrompt,
+            selectedText: selectedText,
+            language: config.resolvedLanguage,
+            includeLanguageContract: includeLanguageContract
+        )
 
         devLog(.cliExecution, "Using persistent session for streaming (zero bootstrap overhead)")
 
@@ -447,7 +479,7 @@ final class ShellRunner {
                 timeoutSeconds: config.timeoutSeconds,
                 onChunk: onChunk
             )
-            let trimmed = ShellRunner.trimPreservingInternalNewlines(result.text)
+            let trimmed = finishedCLIOutput(result.text, includeLanguageContract: includeLanguageContract)
             guard !trimmed.isEmpty else {
                 devLog(.cliResponse, "Persistent session streaming returned empty, falling back")
                 return nil
@@ -705,6 +737,231 @@ final class ShellRunner {
         }
 
         return accumulatedOutput
+    }
+
+    private func preparedPrompt(
+        systemPrompt: String,
+        selectedText: String,
+        language: String,
+        includeLanguageContract: Bool
+    ) -> String {
+        let system = AppConfig.correctionSystemPrompt(
+            systemPrompt: systemPrompt,
+            language: language,
+            includeLanguageContract: includeLanguageContract
+        )
+        let body = includeLanguageContract ? Self.taggedSelectedText(selectedText) : selectedText
+        return "\(system)\n\n\(body)"
+    }
+
+    private func finishedCLIOutput(_ text: String, includeLanguageContract: Bool) -> String {
+        let source = includeLanguageContract ? Self.correctionOnly(in: text) : text
+        return Self.trimPreservingInternalNewlines(source)
+    }
+
+    static func delimitedCorrection(in text: String) -> String? {
+        let startMarker = "<<<TEXT>>>"
+        let endMarker = "<<<END>>>"
+        guard let start = text.range(of: startMarker),
+              let end = text.range(of: endMarker, range: start.upperBound..<text.endIndex) else {
+            return nil
+        }
+        return String(text[start.upperBound..<end.lowerBound])
+    }
+
+    /// Keeps the corrected text and drops labels, fences, and explanations.
+    static func correctionOnly(in text: String) -> String {
+        let withoutThinking = stripThinkingResidue(text)
+        return trimEdges(stripIrrelevant(stripThinkingResidue(extractDelimited(strippingSelectedTags(withoutThinking)))))
+    }
+
+    /// Isolates the selection so a switch inside it stays data, not an instruction.
+    static func taggedSelectedText(_ text: String) -> String {
+        "<selected>\n\(text)\n</selected>"
+    }
+
+    static func strippingSelectedTags(_ text: String) -> String {
+        text.replacingOccurrences(of: "<selected>", with: "")
+            .replacingOccurrences(of: "</selected>", with: "")
+    }
+
+    /// qwen appends `/no_think` on the correction line and may wrap reasoning in `<think>`.
+    static func stripThinkingResidue(_ text: String) -> String {
+        var result = text
+        while let start = result.range(of: "<think>", options: .caseInsensitive) {
+            if let end = result.range(of: "</think>", options: .caseInsensitive, range: start.upperBound..<result.endIndex) {
+                result.removeSubrange(start.lowerBound..<end.upperBound)
+            } else {
+                result.removeSubrange(start.lowerBound...)
+                break
+            }
+        }
+        result = result.replacingOccurrences(of: "</think>", with: "", options: .caseInsensitive)
+        return result.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+            .map { strippingThinkSwitch(String($0)) }
+            .joined(separator: "\n")
+    }
+
+    private static func strippingThinkSwitch(_ line: String) -> String {
+        var core = Substring(line)
+        while let last = core.last, last == " " || last == "\t" {
+            core = core.dropLast()
+        }
+        for suffix in ["/no_think", "/think"] {
+            guard core.hasSuffix(suffix) else { continue }
+            let prefix = core.dropLast(suffix.count)
+            if suffix == "/think", let previous = prefix.last, previous != " " && previous != "\t" {
+                continue
+            }
+            var kept = prefix
+            while let last = kept.last, last == " " || last == "\t" {
+                kept = kept.dropLast()
+            }
+            return String(kept)
+        }
+        return line
+    }
+
+    static func trimEdges(_ text: String) -> String {
+        let lines = text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+        guard let first = lines.firstIndex(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }),
+              let last = lines.lastIndex(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) else {
+            return ""
+        }
+        var relevant = Array(lines[first...last])
+        relevant[0] = Substring(relevant[0].drop(while: { $0 == " " || $0 == "\t" }))
+        let lastIdx = relevant.count - 1
+        relevant[lastIdx] = Substring(relevant[lastIdx].replacingOccurrences(
+            of: "\\s+$", with: "", options: .regularExpression
+        ))
+        return relevant.joined(separator: "\n")
+    }
+
+    static func extractDelimited(_ text: String) -> String {
+        let startMarker = "<<<TEXT>>>"
+        let endMarker = "<<<END>>>"
+        if let start = text.range(of: startMarker) {
+            let afterStart = text[start.upperBound...]
+            if let end = afterStart.range(of: endMarker) {
+                return String(afterStart[..<end.lowerBound])
+            }
+            return String(afterStart)
+        }
+        if text.range(of: endMarker) != nil {
+            return ""
+        }
+        return text
+    }
+
+    static func stripIrrelevant(_ text: String) -> String {
+        var lines = text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline).map(String.init)
+        lines = dropContractEcho(lines)
+        lines = dropLeadingLabels(lines)
+        lines = unwrapMarkdownFence(lines)
+        if let index = lines.firstIndex(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) {
+            lines[index] = stripInlinePrefix(from: lines[index])
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    static func dropContractEcho(_ lines: [String]) -> [String] {
+        lines.filter { !isContractEcho($0) }
+    }
+
+    static func isContractEcho(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty { return false }
+        if trimmed == "<<<TEXT>>>" || trimmed == "<<<END>>>" { return true }
+        let patterns = [
+            #"^Output language: .+\.?$"#,
+            #"^This overrides any instruction to preserve the original language\.?$"#,
+            #"^Detect the language of the input and correct it in that same language\. Do not translate\.?$"#,
+            #"^Output format:?$"#,
+            #"^Return exactly one block and nothing else\.?$"#,
+            #"^final text only$"#,
+            #"^Do not add a title, label, quotes, or explanation outside the block\.?$"#,
+            #"^Preserve line breaks, blank lines, and paragraph spacing inside the block\.?$"#,
+            #"^If the input is already in .+, correct it and keep it in .+\.?$"#,
+            #"^If the input is not in .+, translate it into .+\. Do not leave any sentence in another language\.?$"#,
+            #"^If the input is already in .+, correct it and keep it in .+\. If the input is not in .+, translate it into .+\. Do not leave any sentence in another language\.?$"#,
+            #"^Target language: .+\. Keep text already in .+\. Translate every other sentence into .+\.?$"#,
+            #"^Target language: .+\. Translate the user text into .+\. If it is already .+, correct the grammar\. Do not return the original language\.?$"#,
+            #"^Keep the input language\. Do not translate\.?$"#,
+            #"^Put the result between the markers\. Do not copy these instructions\.?$"#,
+        ]
+        return patterns.contains { trimmed.range(of: $0, options: .regularExpression) != nil }
+    }
+
+    static func dropLeadingLabels(_ lines: [String]) -> [String] {
+        var lines = lines
+        while true {
+            guard let firstIndex = lines.firstIndex(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) else {
+                return lines
+            }
+            guard isLeadingLabel(lines[firstIndex]) else { return lines }
+            let rest = Array(lines[(firstIndex + 1)...])
+            guard rest.contains(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) else { return lines }
+            lines = rest
+            while lines.first?.trimmingCharacters(in: .whitespaces).isEmpty == true {
+                lines.removeFirst()
+            }
+        }
+    }
+
+    static func unwrapMarkdownFence(_ lines: [String]) -> [String] {
+        guard let first = lines.firstIndex(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }),
+              let last = lines.lastIndex(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }),
+              first < last else {
+            return lines
+        }
+        let open = lines[first].trimmingCharacters(in: .whitespaces)
+        let close = lines[last].trimmingCharacters(in: .whitespaces)
+        guard open.hasPrefix("```"), close == "```" else { return lines }
+        return Array(lines[(first + 1)..<last])
+    }
+
+    static func isLeadingLabel(_ line: String) -> Bool {
+        let normalized = normalizedLabel(line)
+            .trimmingCharacters(in: CharacterSet(charactersIn: ":：.。 "))
+            .lowercased()
+        guard !normalized.isEmpty, normalized.count <= 40 else { return false }
+        return [
+            "here is the corrected text", "here's the corrected text",
+            "here is the correction", "here's the correction",
+            "here is the translation", "here's the translation",
+            "here is the result", "corrected text", "corrected version",
+            "correction", "translation", "translated text", "final text", "output",
+            "改正如下", "修正如下", "纠正如下", "翻译如下", "输出如下",
+        ].contains(normalized)
+    }
+
+    static func normalizedLabel(_ line: String) -> String {
+        var text = line.trimmingCharacters(in: .whitespaces)
+        text = text.replacingOccurrences(of: "**", with: "")
+        text = text.replacingOccurrences(of: "__", with: "")
+        if text.hasPrefix("#") {
+            text = text.trimmingCharacters(in: CharacterSet(charactersIn: "# ")).trimmingCharacters(in: .whitespaces)
+        }
+        return text
+    }
+
+    static func stripInlinePrefix(from line: String) -> String {
+        let prefixes = [
+            "here's the corrected text:", "here is the corrected text:",
+            "here's the correction:", "here is the correction:",
+            "here's the translation:", "here is the translation:",
+            "corrected text:", "corrected version:", "correction:", "translation:",
+            "改正如下：", "修正如下：", "纠正如下：", "翻译如下：", "输出如下：",
+            "以下是修正后的文本：", "以下是改正后的文本：", "以下是翻译：", "以下是修正：", "以下是改正：",
+        ]
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        let lower = trimmed.lowercased()
+        for prefix in prefixes {
+            guard lower.hasPrefix(prefix) else { continue }
+            let rest = trimmed.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
+            if !rest.isEmpty { return String(rest) }
+        }
+        return line
     }
 
     /// Trims leading/trailing whitespace and newlines from the CLI output

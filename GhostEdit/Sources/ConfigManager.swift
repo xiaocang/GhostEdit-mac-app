@@ -4,7 +4,9 @@ enum CLIProvider: String, Codable, CaseIterable {
     case claude
     case codex
     case gemini
+    case grok
     case ollama
+    case magpie
 
     static let `default`: CLIProvider = .claude
 
@@ -12,7 +14,6 @@ enum CLIProvider: String, Codable, CaseIterable {
         let displayName: String
         let authCommand: String
         let configPathKey: String
-        let availableModels: [String]
         let defaultModel: String
     }
 
@@ -20,36 +21,37 @@ enum CLIProvider: String, Codable, CaseIterable {
         displayName: "Claude",
         authCommand: "claude auth login",
         configPathKey: "claudePath",
-        availableModels: [
-            "claude-haiku-4-5", "claude-sonnet-4-5", "claude-sonnet-4-6",
-            "claude-opus-4-6", "haiku", "sonnet", "opus"
-        ],
         defaultModel: "claude-haiku-4-5"
     )
     private static let codexMetadata = Metadata(
         displayName: "Codex",
         authCommand: "codex login",
         configPathKey: "codexPath",
-        availableModels: ["gpt-5-codex", "gpt-5.3-codex", "gpt-5"],
         defaultModel: "gpt-5-codex"
     )
     private static let geminiMetadata = Metadata(
         displayName: "Gemini",
         authCommand: "gemini",
         configPathKey: "geminiPath",
-        availableModels: [
-            "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro",
-            "gemini-3-flash-preview", "gemini-3-pro-preview",
-            "gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools"
-        ],
         defaultModel: "gemini-2.5-flash-lite"
+    )
+    private static let grokMetadata = Metadata(
+        displayName: "Grok",
+        authCommand: "grok login",
+        configPathKey: "grokPath",
+        defaultModel: ""
     )
     private static let ollamaMetadata = Metadata(
         displayName: "Ollama (Local)",
         authCommand: "ollama serve",
         configPathKey: "ollamaBaseURL",
-        availableModels: ["qwen3:1.7b", "qwen3:0.6b"],
-        defaultModel: "qwen3:1.7b"
+        defaultModel: ""
+    )
+    private static let magpieMetadata = Metadata(
+        displayName: "Magpie",
+        authCommand: "magpie",
+        configPathKey: "magpieBaseURL",
+        defaultModel: ""
     )
 
     private var metadata: Metadata {
@@ -57,7 +59,9 @@ enum CLIProvider: String, Codable, CaseIterable {
         case .claude: return Self.claudeMetadata
         case .codex: return Self.codexMetadata
         case .gemini: return Self.geminiMetadata
+        case .grok: return Self.grokMetadata
         case .ollama: return Self.ollamaMetadata
+        case .magpie: return Self.magpieMetadata
         }
     }
 
@@ -65,14 +69,20 @@ enum CLIProvider: String, Codable, CaseIterable {
     var displayName: String { metadata.displayName }
     var authCommand: String { metadata.authCommand }
     var configPathKey: String { metadata.configPathKey }
-    var availableModels: [String] { metadata.availableModels }
     var defaultModel: String { metadata.defaultModel }
+    var usesHTTP: Bool {
+        switch self {
+        case .ollama, .magpie: return true
+        case .claude, .codex, .gemini, .grok: return false
+        }
+    }
 }
 
 struct AppConfig: Codable, Equatable {
     var claudePath: String
     var codexPath: String
     var geminiPath: String
+    var grokPath: String
     var provider: String
     var model: String
     var timeoutSeconds: Int
@@ -84,18 +94,21 @@ struct AppConfig: Codable, Equatable {
     var language: String
     var soundFeedbackEnabled: Bool
     var notifyOnSuccess: Bool
-    var clipboardOnlyMode: Bool
     var tonePreset: String
-    var showDiffPreview: Bool
     var liveFeedbackEnabled: Bool
-    var diffPreviewDuration: Int
-    var localModelRepoID: String
-    var localModelCustomModels: String
-    var localModelPromptTemplates: String
-    var localModelPythonPath: String
-    var cloudHotkeyKeyCode: UInt32
-    var cloudHotkeyModifiers: UInt32
     var ollamaBaseURL: String
+    var magpieBaseURL: String
+    /// Background alpha of the correction box. Lower is more transparent. Text stays opaque.
+    var floaterOpacity: Double
+
+    static let defaultFloaterOpacity = 0.42
+    static let minimumFloaterOpacity = 0.15
+    static let maximumFloaterOpacity = 1.0
+
+    static func clampedFloaterOpacity(_ value: Double) -> Double {
+        let finite = value.isFinite ? value : defaultFloaterOpacity
+        return min(maximumFloaterOpacity, max(minimumFloaterOpacity, finite))
+    }
 
     static let `default` = AppConfig(
         claudePath: "",
@@ -112,17 +125,8 @@ struct AppConfig: Codable, Equatable {
         language: "auto",
         soundFeedbackEnabled: true,
         notifyOnSuccess: false,
-        clipboardOnlyMode: false,
         tonePreset: "default",
-        showDiffPreview: false,
-        liveFeedbackEnabled: false,
-        diffPreviewDuration: 5,
-        localModelRepoID: "",
-        localModelCustomModels: "[]",
-        localModelPromptTemplates: "{}",
-        localModelPythonPath: "",
-        cloudHotkeyKeyCode: 14,
-        cloudHotkeyModifiers: 768
+        liveFeedbackEnabled: false
     )
 
     static let supportedPresets: [String] = [
@@ -195,18 +199,12 @@ struct AppConfig: Codable, Equatable {
         case language
         case soundFeedbackEnabled
         case notifyOnSuccess
-        case clipboardOnlyMode
         case tonePreset
-        case showDiffPreview
         case liveFeedbackEnabled
-        case diffPreviewDuration
-        case localModelRepoID
-        case localModelCustomModels
-        case localModelPromptTemplates
-        case localModelPythonPath
-        case cloudHotkeyKeyCode
-        case cloudHotkeyModifiers
         case ollamaBaseURL
+        case grokPath
+        case magpieBaseURL
+        case floaterOpacity
     }
 
     init(
@@ -224,18 +222,12 @@ struct AppConfig: Codable, Equatable {
         language: String = "auto",
         soundFeedbackEnabled: Bool = true,
         notifyOnSuccess: Bool = false,
-        clipboardOnlyMode: Bool = false,
         tonePreset: String = "default",
-        showDiffPreview: Bool = false,
         liveFeedbackEnabled: Bool = false,
-        diffPreviewDuration: Int = 5,
-        localModelRepoID: String = "",
-        localModelCustomModels: String = "[]",
-        localModelPromptTemplates: String = "{}",
-        localModelPythonPath: String = "",
-        cloudHotkeyKeyCode: UInt32 = 14,
-        cloudHotkeyModifiers: UInt32 = 768,
-        ollamaBaseURL: String = "http://127.0.0.1:11434"
+        ollamaBaseURL: String = "http://127.0.0.1:11434",
+        grokPath: String = "",
+        magpieBaseURL: String = "http://127.0.0.1:3425",
+        floaterOpacity: Double = AppConfig.defaultFloaterOpacity
     ) {
         self.claudePath = claudePath
         self.codexPath = codexPath
@@ -251,18 +243,12 @@ struct AppConfig: Codable, Equatable {
         self.language = language
         self.soundFeedbackEnabled = soundFeedbackEnabled
         self.notifyOnSuccess = notifyOnSuccess
-        self.clipboardOnlyMode = clipboardOnlyMode
         self.tonePreset = tonePreset
-        self.showDiffPreview = showDiffPreview
         self.liveFeedbackEnabled = liveFeedbackEnabled
-        self.diffPreviewDuration = diffPreviewDuration
-        self.localModelRepoID = localModelRepoID
-        self.localModelCustomModels = localModelCustomModels
-        self.localModelPromptTemplates = localModelPromptTemplates
-        self.localModelPythonPath = localModelPythonPath
-        self.cloudHotkeyKeyCode = cloudHotkeyKeyCode
-        self.cloudHotkeyModifiers = cloudHotkeyModifiers
         self.ollamaBaseURL = ollamaBaseURL
+        self.grokPath = grokPath
+        self.magpieBaseURL = magpieBaseURL
+        self.floaterOpacity = floaterOpacity
     }
 
     init(from decoder: Decoder) throws {
@@ -271,6 +257,7 @@ struct AppConfig: Codable, Equatable {
         claudePath = try container.decodeIfPresent(String.self, forKey: .claudePath) ?? ""
         codexPath = try container.decodeIfPresent(String.self, forKey: .codexPath) ?? ""
         geminiPath = try container.decodeIfPresent(String.self, forKey: .geminiPath) ?? ""
+        grokPath = try container.decodeIfPresent(String.self, forKey: .grokPath) ?? ""
         provider = try container.decodeIfPresent(String.self, forKey: .provider) ?? CLIProvider.default.rawValue
         model = try container.decodeIfPresent(String.self, forKey: .model) ?? AppConfig.default.model
         timeoutSeconds = try container.decodeIfPresent(Int.self, forKey: .timeoutSeconds) ?? AppConfig.default.timeoutSeconds
@@ -282,18 +269,13 @@ struct AppConfig: Codable, Equatable {
         language = try container.decodeIfPresent(String.self, forKey: .language) ?? AppConfig.default.language
         soundFeedbackEnabled = try container.decodeIfPresent(Bool.self, forKey: .soundFeedbackEnabled) ?? AppConfig.default.soundFeedbackEnabled
         notifyOnSuccess = try container.decodeIfPresent(Bool.self, forKey: .notifyOnSuccess) ?? AppConfig.default.notifyOnSuccess
-        clipboardOnlyMode = try container.decodeIfPresent(Bool.self, forKey: .clipboardOnlyMode) ?? AppConfig.default.clipboardOnlyMode
         tonePreset = try container.decodeIfPresent(String.self, forKey: .tonePreset) ?? AppConfig.default.tonePreset
-        showDiffPreview = try container.decodeIfPresent(Bool.self, forKey: .showDiffPreview) ?? AppConfig.default.showDiffPreview
         liveFeedbackEnabled = try container.decodeIfPresent(Bool.self, forKey: .liveFeedbackEnabled) ?? AppConfig.default.liveFeedbackEnabled
-        diffPreviewDuration = try container.decodeIfPresent(Int.self, forKey: .diffPreviewDuration) ?? AppConfig.default.diffPreviewDuration
-        localModelRepoID = try container.decodeIfPresent(String.self, forKey: .localModelRepoID) ?? AppConfig.default.localModelRepoID
-        localModelCustomModels = try container.decodeIfPresent(String.self, forKey: .localModelCustomModels) ?? AppConfig.default.localModelCustomModels
-        localModelPromptTemplates = try container.decodeIfPresent(String.self, forKey: .localModelPromptTemplates) ?? AppConfig.default.localModelPromptTemplates
-        localModelPythonPath = try container.decodeIfPresent(String.self, forKey: .localModelPythonPath) ?? AppConfig.default.localModelPythonPath
-        cloudHotkeyKeyCode = try container.decodeIfPresent(UInt32.self, forKey: .cloudHotkeyKeyCode) ?? hotkeyKeyCode
-        cloudHotkeyModifiers = try container.decodeIfPresent(UInt32.self, forKey: .cloudHotkeyModifiers) ?? (hotkeyModifiers | 512)
         ollamaBaseURL = try container.decodeIfPresent(String.self, forKey: .ollamaBaseURL) ?? AppConfig.default.ollamaBaseURL
+        magpieBaseURL = try container.decodeIfPresent(String.self, forKey: .magpieBaseURL) ?? AppConfig.default.magpieBaseURL
+        floaterOpacity = Self.clampedFloaterOpacity(
+            try container.decodeIfPresent(Double.self, forKey: .floaterOpacity) ?? Self.defaultFloaterOpacity
+        )
     }
 
     var resolvedClaudePath: String? {
@@ -322,7 +304,9 @@ struct AppConfig: Codable, Equatable {
             value = codexPath
         case .gemini:
             value = geminiPath
-        case .ollama:
+        case .grok:
+            value = grokPath
+        case .ollama, .magpie:
             return nil
         }
 
@@ -348,15 +332,32 @@ struct AppConfig: Codable, Equatable {
         return trimmed.isEmpty ? "auto" : trimmed
     }
 
-    static func languageInstruction(for language: String) -> String? {
-        let code = language.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    static let outputFormatInstruction = """
+    Put the result between the markers. Do not copy these instructions.
+    <<<TEXT>>>
+    <<<END>>>
+    """
+
+    static func languageInstruction(for language: String) -> String {
+        let raw = language.trimmingCharacters(in: .whitespacesAndNewlines)
+        let code = raw.lowercased()
         if code.isEmpty || code == "auto" {
-            return "Detect the language of the input text and respond in the same language."
+            return "Keep the input language. Do not translate."
         }
-        guard let entry = supportedLanguages.first(where: { $0.code == code }) else {
-            return "Respond in \(language)."
-        }
-        return "Respond in \(entry.displayName)."
+        let name = supportedLanguages.first(where: { $0.code == code })?.displayName ?? raw
+        return "Target language: \(name). Translate the user text into \(name). If it is already \(name), correct the grammar. Do not return the original language."
+    }
+
+    static func correctionSystemPrompt(
+        systemPrompt: String,
+        language: String,
+        includeLanguageContract: Bool
+    ) -> String {
+        guard includeLanguageContract else { return systemPrompt }
+        var parts = [systemPrompt]
+        parts.append(languageInstruction(for: language))
+        parts.append(outputFormatInstruction)
+        return parts.joined(separator: "\n\n")
     }
 }
 
@@ -415,17 +416,7 @@ final class ConfigManager {
             try "[]\n".write(to: historyURL, atomically: true, encoding: .utf8)
         }
 
-        // Ensure scripts directory exists for local model inference
-        let scriptsDir = baseDirectoryURL.appendingPathComponent("scripts", isDirectory: true)
-        if !fileManager.fileExists(atPath: scriptsDir.path) {
-            try fileManager.createDirectory(at: scriptsDir, withIntermediateDirectories: true)
-        }
     }
-
-    var scriptsDirectoryURL: URL {
-        baseDirectoryURL.appendingPathComponent("scripts", isDirectory: true)
-    }
-
     func loadPrompt() throws -> String {
         if let cached = cachedPrompt {
             return cached
@@ -477,7 +468,6 @@ final class ConfigManager {
         let historyLimit = max(1, config.historyLimit)
         let normalizedTone = config.tonePreset.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let tonePreset = AppConfig.supportedPresets.contains(normalizedTone) ? normalizedTone : "default"
-        let normalizedPromptTemplates = normalizePromptTemplateJSON(config.localModelPromptTemplates)
 
         return AppConfig(
             claudePath: config.claudePath,
@@ -494,33 +484,15 @@ final class ConfigManager {
             language: config.resolvedLanguage,
             soundFeedbackEnabled: config.soundFeedbackEnabled,
             notifyOnSuccess: config.notifyOnSuccess,
-            clipboardOnlyMode: config.clipboardOnlyMode,
             tonePreset: tonePreset,
-            showDiffPreview: config.showDiffPreview,
             liveFeedbackEnabled: config.liveFeedbackEnabled,
-            diffPreviewDuration: config.diffPreviewDuration,
-            localModelRepoID: config.localModelRepoID,
-            localModelCustomModels: config.localModelCustomModels,
-            localModelPromptTemplates: normalizedPromptTemplates,
-            localModelPythonPath: config.localModelPythonPath,
-            cloudHotkeyKeyCode: config.cloudHotkeyKeyCode,
-            cloudHotkeyModifiers: config.cloudHotkeyModifiers,
-            ollamaBaseURL: config.ollamaBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            ollamaBaseURL: config.ollamaBaseURL.trimmingCharacters(in: .whitespacesAndNewlines),
+            grokPath: config.grokPath,
+            magpieBaseURL: config.magpieBaseURL.trimmingCharacters(in: .whitespacesAndNewlines),
+            floaterOpacity: AppConfig.clampedFloaterOpacity(config.floaterOpacity)
         )
     }
 
-    private func normalizePromptTemplateJSON(_ raw: String) -> String {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else {
-            return "{}"
-        }
-        guard let decoded = try? JSONDecoder().decode([String: String].self, from: data) else {
-            return "{}"
-        }
-        // [String: String] is always encodable to UTF-8 JSON.
-        let encoded = try! JSONEncoder().encode(decoded)
-        return String(decoding: encoded, as: UTF8.self)
-    }
 
     private func migratePromptIfNeeded() throws {
         let existingPrompt = try String(contentsOf: promptURL, encoding: .utf8)

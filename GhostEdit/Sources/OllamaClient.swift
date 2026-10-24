@@ -31,14 +31,23 @@ enum OllamaClientError: LocalizedError {
 
 /// Synchronous API for the correction worker queue; streaming delivery is always on main.
 final class OllamaClient {
+    static let defaultCloudCatalogURL = "https://ollama.com"
+
     private let baseURL: String
     private let timeoutSeconds: Int
     private let configuration: URLSessionConfiguration
+    private let cloudCatalogURL: String
 
-    init(baseURL: String, timeoutSeconds: Int, sessionConfiguration: URLSessionConfiguration = .ephemeral) {
+    init(
+        baseURL: String,
+        timeoutSeconds: Int,
+        sessionConfiguration: URLSessionConfiguration = .ephemeral,
+        cloudCatalogURL: String = OllamaClient.defaultCloudCatalogURL
+    ) {
         self.baseURL = baseURL
         self.timeoutSeconds = max(1, timeoutSeconds)
         self.configuration = sessionConfiguration
+        self.cloudCatalogURL = cloudCatalogURL
     }
 
     func correctText(
@@ -71,12 +80,45 @@ final class OllamaClient {
     }
 
     func listModels() throws -> [String] {
+        let local = try fetchModelNames(baseURL: baseURL)
+        // Cloud catalog failure must not hide models already installed locally.
+        let catalog = (try? fetchModelNames(baseURL: cloudCatalogURL)) ?? []
+        return Self.mergingCloudModels(local: local, catalog: catalog)
+    }
+
+    /// Local daemon names for ollama.com catalog entries.
+    /// Untagged names become `kimi-k3:cloud`. Tagged names become `gpt-oss:120b-cloud`,
+    /// because `gpt-oss:cloud` does not resolve when several sizes exist.
+    static func cloudModelName(for catalogName: String) -> String {
+        let trimmed = catalogName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        if trimmed.hasSuffix(":cloud") || trimmed.hasSuffix("-cloud") { return trimmed }
+        if trimmed.contains(":") { return trimmed + "-cloud" }
+        return trimmed + ":cloud"
+    }
+
+    static func mergingCloudModels(local: [String], catalog: [String]) -> [String] {
+        var seen = Set(local)
+        var merged = local
+        for name in catalog {
+            let cloudName = cloudModelName(for: name)
+            guard !cloudName.isEmpty, seen.insert(cloudName).inserted else { continue }
+            merged.append(cloudName)
+        }
+        return merged
+    }
+
+    private func fetchModelNames(baseURL: String) throws -> [String] {
         let exchange = OllamaExchange(streaming: false, listingModels: true)
-        try perform(makeRequest(path: "api/tags"), exchange: exchange)
+        try perform(makeRequest(baseURL: baseURL, path: "api/tags"), exchange: exchange)
         return exchange.models
     }
 
     private func makeRequest(path: String) throws -> URLRequest {
+        try makeRequest(baseURL: baseURL, path: path)
+    }
+
+    private func makeRequest(baseURL: String, path: String) throws -> URLRequest {
         guard let url = URL(string: baseURL.trimmingCharacters(in: .whitespacesAndNewlines)),
               let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
               url.host != nil, url.query == nil, url.fragment == nil else {
@@ -186,7 +228,31 @@ private final class OllamaExchange: NSObject, URLSessionDataDelegate {
         do {
             if listingModels {
                 struct ModelList: Decodable {
-                    struct Model: Decodable { let name: String }
+                    struct Model: Decodable {
+                        let name: String
+
+                        init(from decoder: Decoder) throws {
+                            let container = try decoder.container(keyedBy: CodingKeys.self)
+                            let name = try container.decodeIfPresent(String.self, forKey: .name)?
+                                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                            let model = try container.decodeIfPresent(String.self, forKey: .model)?
+                                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                            let resolved = name.isEmpty ? model : name
+                            guard !resolved.isEmpty else {
+                                throw DecodingError.dataCorruptedError(
+                                    forKey: .name,
+                                    in: container,
+                                    debugDescription: "missing model name"
+                                )
+                            }
+                            self.name = resolved
+                        }
+
+                        private enum CodingKeys: String, CodingKey {
+                            case name
+                            case model
+                        }
+                    }
                     let models: [Model]
                 }
                 do { models = try JSONDecoder().decode(ModelList.self, from: buffer).models.map(\.name) }

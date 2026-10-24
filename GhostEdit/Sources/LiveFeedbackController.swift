@@ -55,18 +55,10 @@ final class LiveFeedbackController {
         return home.appendingPathComponent(".ghostedit/ignored_words.json")
     }()
 
-    // Model-based feedback
-    private var modelDebounceTimer: Timer?
-    private var modelCheckInProgress = false
-    private var lastModelCheckedText: String?
-    private var modelCheckGeneration: UInt64 = 0
     private weak var configManagerRef: ConfigManager?
-    private var localModelRunnerRef: LocalModelRunner?
-    static let modelDebounceInterval: TimeInterval = 2.5
 
-    init(configManager: ConfigManager? = nil, localModelRunner: LocalModelRunner? = nil) {
+    init(configManager: ConfigManager? = nil) {
         self.configManagerRef = configManager
-        self.localModelRunnerRef = localModelRunner
     }
 
     // MARK: - Lifecycle
@@ -81,29 +73,6 @@ final class LiveFeedbackController {
             self?.schedulePoll()
         }
 
-        // Pre-warm local model if configured
-        if let configManager = configManagerRef {
-            let config = configManager.loadConfig()
-            if !config.localModelRepoID.isEmpty, let runner = localModelRunnerRef {
-                let modelPath = LocalModelSupport.modelDirectoryURL(
-                    baseDirectoryURL: configManager.baseDirectoryURL,
-                    repoID: config.localModelRepoID
-                ).path
-                let pythonPath = config.localModelPythonPath.isEmpty
-                    ? PythonEnvironmentSupport.detectPythonPath(homeDirectoryPath: FileManager.default.homeDirectoryForCurrentUser.path)
-                    : config.localModelPythonPath
-                let promptTemplate = LocalModelSupport.resolvedPromptTemplate(for: config.localModelRepoID, config: config)
-                backgroundQueue.async {
-                    _ = try? runner.correctText(
-                        "Hello.",
-                        modelPath: modelPath,
-                        pythonPath: pythonPath,
-                        timeoutSeconds: 30,
-                        promptTemplate: promptTemplate
-                    )
-                }
-            }
-        }
     }
 
     func stop() {
@@ -111,22 +80,18 @@ final class LiveFeedbackController {
         pollingTimer = nil
         debounceTimer?.invalidate()
         debounceTimer = nil
-        modelDebounceTimer?.invalidate()
-        modelDebounceTimer = nil
+
         popoverDismissTimer?.invalidate()
         popoverDismissTimer = nil
         dismissWidget()
         dismissPopover()
         lastCheckedText = nil
         currentCheckedText = nil
-        lastModelCheckedText = nil
         currentIssues = []
         currentFocusedPID = nil
         state = .idle
         isPolling = false
         isMouseInsidePopover = false
-        modelCheckInProgress = false
-        modelCheckGeneration &+= 1
     }
 
     // MARK: - Polling
@@ -213,7 +178,6 @@ final class LiveFeedbackController {
             DispatchQueue.main.async { [weak self] in
                 self?.lastCheckedText = text
                 self?.applyResults(issues, element: element)
-                self?.scheduleModelCheck(text, element: element)
             }
         }
     }
@@ -366,154 +330,6 @@ final class LiveFeedbackController {
         positionWidget(near: element)
     }
 
-    // MARK: - Model-Based Check
-
-    private func scheduleModelCheck(_ text: String, element: AXUIElement) {
-        guard let config = configManagerRef?.loadConfig(),
-              !config.localModelRepoID.isEmpty,
-              localModelRunnerRef != nil else {
-            return
-        }
-
-        // Skip if text hasn't changed since last model check
-        if text == lastModelCheckedText { return }
-
-        modelDebounceTimer?.invalidate()
-        modelDebounceTimer = Timer.scheduledTimer(
-            withTimeInterval: Self.modelDebounceInterval,
-            repeats: false
-        ) { [weak self] _ in
-            self?.triggerModelCheck(text, element: element)
-        }
-    }
-
-    private func triggerModelCheck(_ text: String, element: AXUIElement) {
-        guard !modelCheckInProgress,
-              let configManager = configManagerRef,
-              let runner = localModelRunnerRef else {
-            return
-        }
-        let config = configManager.loadConfig()
-        guard !config.localModelRepoID.isEmpty else { return }
-
-        modelCheckInProgress = true
-        let generation = modelCheckGeneration
-        let pythonPath = config.localModelPythonPath.isEmpty
-            ? PythonEnvironmentSupport.detectPythonPath(homeDirectoryPath: FileManager.default.homeDirectoryForCurrentUser.path)
-            : config.localModelPythonPath
-        let modelPath = LocalModelSupport.modelDirectoryURL(
-            baseDirectoryURL: configManager.baseDirectoryURL,
-            repoID: config.localModelRepoID
-        ).path
-        let promptTemplate = LocalModelSupport.resolvedPromptTemplate(for: config.localModelRepoID, config: config)
-
-        backgroundQueue.async { [weak self] in
-            let corrected = try? runner.correctText(
-                text,
-                modelPath: modelPath,
-                pythonPath: pythonPath,
-                timeoutSeconds: 30,
-                promptTemplate: promptTemplate
-            )
-
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.modelCheckInProgress = false
-
-                // Discard stale results
-                guard generation == self.modelCheckGeneration,
-                      text == self.lastCheckedText else {
-                    return
-                }
-
-                self.lastModelCheckedText = text
-
-                guard let corrected, corrected != text else { return }
-
-                let modelIssues = Self.extractIssuesFromDiff(original: text, corrected: corrected)
-                if !modelIssues.isEmpty {
-                    self.mergeModelIssues(modelIssues, element: element)
-                }
-            }
-        }
-    }
-
-    static func extractIssuesFromDiff(original: String, corrected: String) -> [SpellCheckIssue] {
-        let segments = DiffSupport.wordDiff(old: original, new: corrected)
-        var issues: [SpellCheckIssue] = []
-        let nsOriginal = original as NSString
-        var scanOffset = 0
-
-        var i = 0
-        while i < segments.count {
-            let seg = segments[i]
-
-            if seg.kind == .deletion {
-                // Find matching range in original
-                let searchRange = NSRange(location: scanOffset, length: nsOriginal.length - scanOffset)
-                let foundRange = nsOriginal.range(of: seg.text, range: searchRange)
-                guard foundRange.location != NSNotFound else {
-                    i += 1
-                    continue
-                }
-
-                // Check if next segment is an insertion (replacement pair)
-                var suggestion = ""
-                if i + 1 < segments.count && segments[i + 1].kind == .insertion {
-                    suggestion = segments[i + 1].text
-                    i += 1
-                }
-
-                if !suggestion.isEmpty {
-                    issues.append(SpellCheckIssue(
-                        word: seg.text,
-                        range: foundRange,
-                        kind: .grammar,
-                        suggestions: [suggestion]
-                    ))
-                }
-
-                scanOffset = foundRange.location + foundRange.length
-            } else if seg.kind == .equal {
-                // Advance scan offset past equal text
-                let searchRange = NSRange(location: scanOffset, length: nsOriginal.length - scanOffset)
-                let foundRange = nsOriginal.range(of: seg.text, range: searchRange)
-                if foundRange.location != NSNotFound {
-                    scanOffset = foundRange.location + foundRange.length
-                }
-            }
-
-            i += 1
-        }
-
-        return issues
-    }
-
-    private func mergeModelIssues(_ modelIssues: [SpellCheckIssue], element: AXUIElement) {
-        var merged = currentIssues
-        for issue in modelIssues {
-            let overlaps = merged.contains { existing in
-                existing.range.intersection(issue.range) != nil
-            }
-            if !overlaps {
-                merged.append(issue)
-            }
-        }
-        merged.sort { $0.range.location < $1.range.location }
-
-        let filtered = SpellCheckSupport.filterIssues(merged, ignoredWords: ignoredWords)
-        let displayIssues = SpellCheckSupport.truncateForDisplay(filtered)
-        currentIssues = displayIssues
-
-        if displayIssues.isEmpty {
-            updateState(.clean)
-            dismissPopover()
-        } else {
-            updateState(.issues(displayIssues.count))
-        }
-
-        positionWidget(near: element)
-    }
 
     // MARK: - State
 
