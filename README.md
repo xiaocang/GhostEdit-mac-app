@@ -1,10 +1,10 @@
 # GhostEdit
 
-**Free, open-source grammar checker for macOS. Press one hotkey in any app. GhostEdit shows a nearby diff and a Copy button. It does not replace the selected text. Use Ollama, Claude, OpenAI Codex, or Gemini.**
+**Free, open-source grammar checker for macOS. Press one hotkey in any app. GhostEdit shows a compact correction floater with a nearby diff and Copy button; it never replaces the selected text. Connect Claude, Codex, Gemini, Grok, Ollama, or a Magpie gateway.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platform: macOS](https://img.shields.io/badge/Platform-macOS%2013%2B-black.svg)](https://github.com/nareshnavinash/GhostEdit/releases)
-[![Latest Release](https://img.shields.io/github/v/release/nareshnavinash/GhostEdit)](https://github.com/nareshnavinash/GhostEdit/releases/latest)
+[![Platform: macOS](https://img.shields.io/badge/Platform-macOS%2013%2B-black.svg)](https://github.com/xiaocang/GhostEdit-mac-app/releases)
+[![Latest Release](https://img.shields.io/github/v/release/xiaocang/GhostEdit-mac-app)](https://github.com/xiaocang/GhostEdit-mac-app/releases/latest)
 
 > GhostEdit is a macOS menu bar app that corrects text system-wide. Press the correction hotkey (cmd+E by default). A small floater appears beside the selection: a ghost while the model works, a green check if nothing changed, or a narrow red/green diff with Copy.
 
@@ -15,7 +15,7 @@
 ### Homebrew (Recommended)
 
 ```bash
-brew tap nareshnavinash/ghostedit
+brew tap xiaocang/homebrew-tap
 brew install --cask ghostedit
 ```
 
@@ -23,7 +23,7 @@ This installs GhostEdit to `/Applications`, clears the quarantine flag automatic
 
 ### Manual Download
 
-Download the latest `.dmg` from the [Releases page](https://github.com/nareshnavinash/GhostEdit/releases/latest), drag GhostEdit to Applications, and grant Accessibility permission.
+Download the latest `.dmg` from the [Releases page](https://github.com/xiaocang/GhostEdit-mac-app/releases/latest), drag GhostEdit to Applications, and grant Accessibility permission.
 
 ### macOS Installation & Troubleshooting
 
@@ -54,11 +54,11 @@ You can now double-click the app to open it normally! (You only need to do this 
 
 ## Why GhostEdit?
 
-- **No account required** - uses AI CLIs you already have installed (Claude, Codex, Gemini). No sign-ups, no subscriptions.
+- **No GhostEdit account** - connect a supported AI CLI or HTTP provider. Provider authentication and service requirements still apply.
 - **Local privacy option** - Ollama at a localhost URL keeps correction text on this Mac. Cloud CLIs and remote Ollama URLs send text to their configured services.
 - **Free and open source** - no premium tiers, no word limits, no feature gates.
 - **Works everywhere** - correct text in any macOS app: Slack, Notion, VS Code, Mail, Pages, or any text field. One hotkey, any app.
-- **Bring your own AI** - switch between Ollama, Claude, OpenAI Codex, and Gemini in Settings.
+- **Bring your own AI** - switch between Claude, Codex, Gemini, Grok, Ollama, and Magpie in Settings.
 - **Review before you copy** - the hotkey never replaces the selection. Copy the result when you want it.
 
 ## How It Works
@@ -77,8 +77,7 @@ Install Ollama or a supported AI CLI. GhostEdit auto-detects the CLI.
 - **One hotkey**: cmd+E by default. It sends the selection, or the line at the cursor, to the provider in Settings.
 - **Nearby floater**: a ghost while the model works, a green check when nothing changed, or a narrow red/green diff with Copy.
 - **No automatic replacement**: Copy puts the result on the clipboard. The selection stays as it is.
-- **Token preservation**: mentions, URLs, emojis, and code blocks are protected before the text is sent to the model.
-- **Fallback**: a retriable model failure retries with the next available model.
+- **Token preservation**: mentions, emojis, URLs, email addresses, file paths, and inline code are protected before correction.
 
 ### Core Features
 
@@ -86,10 +85,11 @@ Install Ollama or a supported AI CLI. GhostEdit auto-detects the CLI.
 - **Nearby result floater**: A ghost and spinner while the request runs. A green check fades when the text is already clean. Changes stay up with Copy until you click outside.
 - **Copy, don't replace**: The Copy button puts the corrected text on the clipboard. The selection is left alone.
 - **Multi-provider support**: Claude, Codex, Gemini, Grok, Ollama, and Magpie. Model lists come from Refresh Models, not a compiled-in catalog.
+- **Settings organized by task**: General, Hotkey, Behavior, and Advanced tabs separate provider setup, shortcuts, correction preferences, and diagnostics.
 - **Multi-language support**: Correct text in 30+ languages - auto-detect or pick a specific language in Settings
 - **Tone presets**: Switch between Default, Casual, Professional, Academic, and Slack tones from the menu bar
 - **Writing coach**: **Sharpen My Writing Style** analyzes your past corrections and shows what you do well plus areas to improve
-- **Token preservation**: Mentions, emojis, URLs, emails, file paths, and inline code are preserved during correction across all paths (cloud, local, streaming, live feedback)
+- **Token preservation**: Mentions, emojis, URLs, email addresses, file paths, and inline code are preserved across supported CLI and HTTP correction providers.
 - **Correction history**: Browse, copy, and export past corrections as CSV
 - **Statistics dashboard**: View correction counts, success rates, provider/model breakdown, and estimated token usage
 - **Narrow diff**: Changed words are shown in red and green. Unchanged runs are shortened so the floater stays small.
@@ -146,25 +146,21 @@ Live Feedback, when enabled, still checks spelling and grammar in the focused fi
 
 ### Prerequisites
 
-Choose local Ollama or one of the cloud CLIs:
+GhostEdit supports command-line providers and HTTP endpoints. Configure a provider in **Settings > General**:
 
-| Provider | Install | Auth |
-|----------|---------|------|
-| Ollama (local HTTP) | Install [Ollama](https://ollama.com), then `ollama pull qwen3:1.7b` | No login for local models |
-| Claude | `brew install claude` or [download](https://claude.com/claude-code) | `claude auth login` |
-| OpenAI Codex | `npm install -g @openai/codex` | `codex login` |
-| Gemini | `npm install -g @google/gemini-cli` | `gemini` |
+| Provider | Setup |
+|----------|-------|
+| Ollama | Install [Ollama](https://ollama.com), start it, and pull a model such as `qwen3:1.7b`. |
+| Claude | Install Claude Code and authenticate with `claude auth login`. |
+| OpenAI Codex | Install `@openai/codex` and authenticate with `codex login`. |
+| Gemini | Install `@google/gemini-cli` and authenticate with `gemini`. |
+| Grok | Install the Grok CLI and authenticate with `grok login`. |
+| Magpie | Run a Magpie-compatible HTTP gateway and set its URL in Settings; the default is `http://127.0.0.1:3425`. |
 
-**Supported models:**
-
-| Provider | Models |
-|----------|--------|
-| Claude | claude-haiku-4-5, claude-sonnet-4-5, claude-sonnet-4-6, claude-opus-4-6, haiku, sonnet, opus |
-| OpenAI Codex | gpt-5-codex, gpt-5.3-codex, gpt-5 |
-| Gemini | gemini-2.5-flash-lite, gemini-2.5-flash, gemini-2.5-pro, gemini-3-flash-preview, gemini-3-pro-preview, gemini-3.1-pro-preview |
-| Ollama | Installed model names from **Refresh Models**, plus Ollama cloud models such as `kimi-k3:cloud` and `gpt-oss:120b-cloud` |
+Use **Refresh Models** to load the model list from the selected provider. Ollama lists installed models and available cloud models; sign in with `ollama signin` before using an Ollama cloud model.
 
 ### Local Ollama Setup
+
 
 1. Start the Ollama app, or run `ollama serve`.
 2. Install a model: `ollama pull qwen3:1.7b`.
@@ -172,7 +168,7 @@ Choose local Ollama or one of the cloud CLIs:
 4. Click **Refresh Models**. The menu lists installed models and Ollama cloud models (`name:cloud`, or `name:tag-cloud` when the catalog name has a size tag). Select one and save. Cloud models run through the local server; sign in with `ollama signin` first.
 5. Focus or select text in another app and press **cmd+E**. Copy the diff if you want the corrected text.
 
-No Python environment or cloud CLI is needed for Ollama. Small models trade correction quality for latency; copy the diff if you want the corrected text. Connection failures suggest starting Ollama; missing-model errors include the `ollama pull` command. If using a proxy, set its server base URL (not `/api/chat`). HTTPS is supported; authenticated services such as Magpie are not configured by this integration.
+No Python environment or cloud CLI is needed for Ollama. Small models trade correction quality for latency; copy the diff if you want the corrected text. Connection failures suggest starting Ollama; missing-model errors include the `ollama pull` command. If using a proxy, set its server base URL (not `/api/chat`). Magpie uses the configured gateway URL.
 
 ## Build from Source
 
@@ -401,9 +397,9 @@ NOTARY_PROFILE="your-notary-profile" ./scripts/notarize_release.sh build/release
 
 A workflow is included at `.github/workflows/release.yml`.
 
-- Push a tag like `v1.0.0`
-- Workflow builds and uploads `.zip` and `.dmg` to the GitHub Release
-- For notarized releases, add signing/notary steps and secrets to the workflow
+Push a version tag such as `v7.9.1.1` to build and publish the `.zip` and `.dmg` release assets. The workflow then updates `Casks/ghostedit.rb` in [`xiaocang/homebrew-tap`](https://github.com/xiaocang/homebrew-tap).
+
+Configure the `HOMEBREW_TAP_TOKEN` Actions secret in this repository with contents-write access to `xiaocang/homebrew-tap`. The release workflow uses it only to commit and push the cask update. For notarized releases, add signing and notarization steps and secrets to the workflow.
 
 ## Privacy
 

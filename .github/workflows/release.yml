@@ -29,3 +29,45 @@ jobs:
           files: |
             build/release/GhostEdit-macOS.zip
             build/release/GhostEdit-macOS.dmg
+      - name: Checkout Homebrew tap
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/checkout@v4
+        with:
+          repository: xiaocang/homebrew-tap
+          path: homebrew-tap
+          ref: master
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Update and publish Homebrew cask
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAP_DIR: homebrew-tap
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          DMG="build/release/GhostEdit-macOS.dmg"
+          SHA256="$(shasum -a 256 "$DMG" | awk '{print $1}')"
+          mkdir -p "$TAP_DIR/Casks"
+          cat > "$TAP_DIR/Casks/ghostedit.rb" <<EOF
+          cask "ghostedit" do
+            version "$VERSION"
+            sha256 "$SHA256"
+
+            url "https://github.com/${GITHUB_REPOSITORY}/releases/download/v#{version}/GhostEdit-macOS.dmg"
+            name "GhostEdit"
+            desc "System-wide grammar checker for macOS"
+            homepage "https://github.com/${GITHUB_REPOSITORY}"
+
+            app "GhostEdit.app"
+          end
+          EOF
+
+          git -C "$TAP_DIR" config user.name "github-actions[bot]"
+          git -C "$TAP_DIR" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$TAP_DIR" add Casks/ghostedit.rb
+          if git -C "$TAP_DIR" diff --cached --quiet; then
+            echo "Homebrew cask is already current."
+          else
+            git -C "$TAP_DIR" commit -m "Update GhostEdit to $VERSION"
+            git -C "$TAP_DIR" push
+          fi
