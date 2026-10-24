@@ -257,7 +257,6 @@
 			isa = PBXGroup;
 			children = (
 				B5DAB86AE24B9D4BB2A49EE7 /* Assets.xcassets */,
-				689D9DC9D2DF4D0740A50D56 /* Resources */,
 				676B21428AFB264011143FE9 /* Sources */,
 			);
 			path = GhostEdit;
@@ -317,13 +316,6 @@
 				D73C78F2EF0D5E5A9DABF365 /* WritingCoachSupport.swift */,
 			);
 			path = Sources;
-			sourceTree = "<group>";
-		};
-		689D9DC9D2DF4D0740A50D56 /* Resources */ = {
-			isa = PBXGroup;
-			children = (
-			);
-			path = Resources;
 			sourceTree = "<group>";
 		};
 		8E5C666D31BAD849DC8FABF1 /* GhostEditTests */ = {
