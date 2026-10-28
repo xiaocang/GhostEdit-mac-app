@@ -4,6 +4,7 @@ import AppKit
 /// Each state has its own ghost. The edit box is translucent, with that ghost at the start.
 final class CorrectionFloaterController: NSObject {
     var onCopy: ((String) -> Void)?
+    var onCopyAndPaste: ((String) -> Void)?
     var onUserDismiss: (() -> Void)?
 
     private var panel: NSPanel?
@@ -36,14 +37,15 @@ final class CorrectionFloaterController: NSObject {
         let text = attributedPreview(DiffSupport.charDiff(old: original, new: corrected))
         let visible = visibleFrame(near: anchor)
         let margin: CGFloat = 16
-        let buttonSize: CGFloat = 14
+        let buttonSize: CGFloat = 18
+        let actionsWidth = buttonSize * 2 + 4
         let ghostSize: CGFloat = 16
         let padX: CGFloat = 6
         let padY: CGFloat = 4
         let ghostGap: CGFloat = 4
         let wrapWidth: CGFloat = 320
         let textLeading = padX + ghostSize + ghostGap
-        let availableWidth = visible.width - margin * 2 - buttonSize - textLeading - padX - 2
+        let availableWidth = visible.width - margin * 2 - actionsWidth - textLeading - padX - 2
         let maxTextWidth = max(48, min(wrapWidth, availableWidth))
         let maxTextHeight = max(18, visible.height - margin * 2 - padY * 2)
         let measured = text.boundingRect(
@@ -53,7 +55,7 @@ final class CorrectionFloaterController: NSObject {
         let textWidth = min(maxTextWidth, max(24, ceil(measured.width)))
         let contentHeight = max(ghostSize, ceil(measured.height) + 2)
         let textHeight = min(maxTextHeight, contentHeight)
-        let width = textLeading + textWidth + 2 + buttonSize + padX
+        let width = textLeading + textWidth + 2 + actionsWidth + padX
         let height = padY + textHeight + padY
 
         let card = makeEditCard(width: width, height: height)
@@ -67,6 +69,18 @@ final class CorrectionFloaterController: NSObject {
         button.action = #selector(copyClicked)
         button.translatesAutoresizingMaskIntoConstraints = false
         button.toolTip = "Copy"
+        button.setAccessibilityLabel("Copy correction")
+
+        let pasteButton = NSButton()
+        pasteButton.isBordered = false
+        pasteButton.image = symbol("arrow.left.arrow.right", pointSize: 11, color: .secondaryLabelColor)
+        pasteButton.imageScaling = .scaleProportionallyDown
+        pasteButton.imagePosition = .imageOnly
+        pasteButton.target = self
+        pasteButton.action = #selector(copyAndPasteClicked)
+        pasteButton.translatesAutoresizingMaskIntoConstraints = false
+        pasteButton.toolTip = "Replace selected text and copy result"
+        pasteButton.setAccessibilityLabel("Replace selected text and copy result")
 
         let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: textWidth, height: contentHeight))
         textView.isEditable = false
@@ -94,11 +108,16 @@ final class CorrectionFloaterController: NSObject {
 
         card.addSubview(ghost)
         card.addSubview(button)
+        card.addSubview(pasteButton)
         card.addSubview(scroll)
         NSLayoutConstraint.activate([
             ghost.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: padX),
             ghost.topAnchor.constraint(equalTo: card.topAnchor, constant: padY),
-            button.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -padX),
+            pasteButton.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -padX),
+            pasteButton.topAnchor.constraint(equalTo: card.topAnchor, constant: padY),
+            pasteButton.widthAnchor.constraint(equalToConstant: buttonSize),
+            pasteButton.heightAnchor.constraint(equalToConstant: buttonSize),
+            button.trailingAnchor.constraint(equalTo: pasteButton.leadingAnchor, constant: -4),
             button.topAnchor.constraint(equalTo: card.topAnchor, constant: padY),
             button.widthAnchor.constraint(equalToConstant: buttonSize),
             button.heightAnchor.constraint(equalToConstant: buttonSize),
@@ -144,6 +163,11 @@ final class CorrectionFloaterController: NSObject {
         guard let correctedText else { return }
         onCopy?(correctedText)
         copyButton?.image = symbol("checkmark", pointSize: 8, color: .systemGreen)
+    }
+
+    @objc private func copyAndPasteClicked() {
+        guard let correctedText else { return }
+        onCopyAndPaste?(correctedText)
     }
 
     private func present(

@@ -38,6 +38,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private var didShowAccessibilityGuidance = false
     private var clipboardSnapshot: ClipboardManager.Snapshot?
     private var pendingClipboardRestore: DispatchWorkItem?
+    private var correctionPasteTarget: NSRunningApplication?
+    private var correctionOriginalText: String?
     private var targetAppAtTrigger: NSRunningApplication?
     private var lastExternalActiveApp: NSRunningApplication?
 
@@ -67,6 +69,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
         correctionFloater.onCopy = { [weak self] text in
             self?.copyFloaterResult(text)
+        }
+        correctionFloater.onCopyAndPaste = { [weak self] text in
+            self?.copyAndPasteFloaterResult(text)
         }
         correctionFloater.onUserDismiss = { [weak self] in
             self?.cancelInFlightCorrection()
@@ -941,6 +946,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func presentCorrection(original: String, corrected: String) {
+        correctionPasteTarget = targetAppAtTrigger
+        correctionOriginalText = original
         restoreClipboardSnapshot(after: 0)
         let anchor = pendingFloaterAnchor
         if corrected == original {
@@ -1745,6 +1752,103 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         clipboardSnapshot = nil
         clipboardManager.writePlainText(text)
         setStatus("Correction copied")
+    }
+
+    private func copyAndPasteFloaterResult(_ text: String) {
+        copyFloaterResult(text)
+        guard let target = correctionPasteTarget, !target.isTerminated,
+              let original = correctionOriginalText,
+              ensureAccessibilityPermission(promptSystemDialog: false, showGuidanceAlert: true) else {
+            reportFloaterPasteFailure("Copied; focus and select the original text to paste")
+            return
+        }
+        let generation = correctionGeneration
+        let deadline = Date().addingTimeInterval(1.5)
+        target.activate(options: [.activateAllWindows])
+
+        func waitForTarget() {
+            guard generation == self.correctionGeneration else { return }
+            guard !target.isTerminated, Date() < deadline else {
+                self.reportFloaterPasteFailure("Copied; could not focus the original app")
+                return
+            }
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.03, execute: waitForTarget)
+                return
+            }
+            guard self.clipboardManager.readPlainText() == text else { return }
+            if let selected = AccessibilityTextSupport.readSelectedText(appPID: target.processIdentifier) {
+                guard selected == original else {
+                    self.reportFloaterPasteFailure("Copied; selection changed, paste manually")
+                    return
+                }
+                self.pasteFloaterSelection(text, target: target, generation: generation)
+            } else {
+                // The original capture supports Cmd+C when AXSelectedText is
+                // unavailable (for example in web/Electron editors). Validate
+                // the same selection through that path instead of always
+                // refusing to paste in those applications.
+                self.verifyFloaterSelectionByCopy(
+                    text, original: original, target: target,
+                    generation: generation, strategyIndex: 0
+                )
+            }
+        }
+        waitForTarget()
+    }
+
+    private func verifyFloaterSelectionByCopy(
+        _ text: String, original: String, target: NSRunningApplication,
+        generation: Int, strategyIndex: Int
+    ) {
+        let strategies: [ClipboardManager.ShortcutPosting] = [.annotatedSession, .hidSystem]
+        guard generation == correctionGeneration else { return }
+        guard strategyIndex < strategies.count,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier else {
+            clipboardManager.writePlainText(text)
+            reportFloaterPasteFailure("Copied; could not verify selection, paste manually")
+            return
+        }
+        let sentinel = "GhostEdit-selection-\(UUID().uuidString)"
+        clipboardManager.writePlainText(sentinel)
+        _ = clipboardManager.simulateCopyShortcut(using: strategies[strategyIndex])
+        waitForCopiedText(sentinel: sentinel, timeoutSeconds: 1.0) { [weak self] selected in
+            guard let self, generation == self.correctionGeneration else { return }
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier else {
+                self.clipboardManager.writePlainText(text)
+                self.reportFloaterPasteFailure("Copied; focus changed, paste manually")
+                return
+            }
+            if selected == nil {
+                self.verifyFloaterSelectionByCopy(
+                    text, original: original, target: target,
+                    generation: generation, strategyIndex: strategyIndex + 1
+                )
+            } else if selected == original {
+                self.pasteFloaterSelection(text, target: target, generation: generation)
+            } else {
+                self.clipboardManager.writePlainText(text)
+                self.reportFloaterPasteFailure("Copied; selection changed, paste manually")
+            }
+        }
+    }
+
+    private func pasteFloaterSelection(_ text: String, target: NSRunningApplication, generation: Int) {
+        guard generation == correctionGeneration,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier else { return }
+        clipboardManager.writePlainText(text)
+        // Paste only over the verified selection. Never select the whole field.
+        guard clipboardManager.simulatePasteShortcut(using: .hidSystem) else {
+            reportFloaterPasteFailure("Copied; paste manually")
+            return
+        }
+        correctionFloater.dismiss()
+        setStatus("Correction copied and paste sent")
+    }
+
+    private func reportFloaterPasteFailure(_ message: String) {
+        setStatus(message)
+        correctionFloater.showError(message, near: pendingFloaterAnchor)
     }
 
     private func cancelInFlightCorrection() {
